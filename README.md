@@ -1,21 +1,16 @@
-# ReadingParallel Python v1.1 — Streamlit Community Cloud
+# ReadingParallel Python v1.2 — Streamlit Cloud
 
-## 雲端部署
+## 修正 2026-11-07 的 Jieba ValueError
 
-1. 將 `app.py`、`corpus.json`、`requirements.txt` 上傳到 GitHub 儲存庫根目錄。
-2. **同層需保留您已上傳的 `dict.txt.big`**，或將其放在 `dictionaries/dict.txt.big`。啟動時自動載入，不會線上下載。
-3. 在 Streamlit Community Cloud 建立 App，選擇該儲存庫、分支及 `app.py` 作為 Main file path。
-4. 首次執行確認畫面頂端顯示「繁體中文大字典已啟用」。
+* 修正 `dict.txt.big` 有非整數詞頻時造成網站無法啟動。
+* 啟動時先核對每行 `詞語 數字詞頻 [詞性]`，無效資料列會略過，並在頁面列出範例。
+* 字典有效詞條少於 1000 筆，或 Jieba 載入失敗時，改用 Jieba 預設字典，保留所有教材及檢測功能。
+* 正常載入時才會顯示「繁體中文大字典已載入」。
 
-本 ZIP 不重新散布您 GitHub 儲存庫已存在的大字典；請沿用 https://github.com/lyy12009/article_adjustment/blob/main/dict.txt.big 。若解壓到新的儲存庫，需自行將檔案複製至上述任一路徑。否則程式仍可執行，但會顯示警告並使用 Jieba 預設字典。
+## GitHub 部署
 
-## 使用流程
+根目錄上傳 `app.py`、`corpus.json`、`requirements.txt`、`dict.txt.big`；Streamlit Cloud Main file path 設定 `app.py`。
 
-側邊選擇冊課與來源篇章 → 複製 Prompt 至 LLM → 貼回新文本 → Python 檢測 → 教師定稿 → 複製命題 Prompt → 貼回題目並檢測 → 匯出 Word。
+`dict.txt.big` 必須是 UTF-8 的純文字字典，非 GitHub 網頁。每行範例：`研究 100 n`。注意數字是詞頻，不是課次。亦可將字典放在 `dictionaries/dict.txt.big`。大字典的版權及來源請依原始發行條款確認。
 
-## 注意
-
-- 教材先前累積生詞是教學詞彙白名單，不等於語料的完整詞彙與所有已學用語。
-- 「疑似超綱」需人工確認；教材詞庫最長匹配也可能遇到歧義。
-- 原文相似度、複現率均為字面統計，無法取代教師對詞義、語法功能與自然度的審查。
-- 本程式不呼叫 LLM API；適合不需要 API Key 的校內或公開教師使用。
+版本依舊以教師複製 Prompt 到外部 LLM 並貼回的工作流程運行，不需要 LLM API Key。檢測報告屬疑似超綱，須人工覆核。

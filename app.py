@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""ReadingParallel Python v1.1: independent teacher-in-the-loop LLM prompt + audit app."""
+"""ReadingParallel Python v1.2: independent teacher-in-the-loop LLM prompt + audit app."""
 from __future__ import annotations
 import io
 import json
@@ -22,50 +22,87 @@ DICT_CANDIDATES = [HERE / 'dict.txt.big', HERE / 'dictionaries' / 'dict.txt.big'
 BIG_DICT = next((p for p in DICT_CANDIDATES if p.is_file() and p.stat().st_size > 0), None)
 USER_DICT = HERE / 'dictionaries' / 'teaching_words.txt'
 
-@st.cache_resource(show_spinner='初始化繁體中文斷詞字典…')
-def build_tokenizer(dict_path: str, userdict_path: str):
-    # 建立一個乾淨的 Tokenizer 實例
-    tokenizer = jieba.Tokenizer()
-    
-    if dict_path and Path(dict_path).is_file():
-        try:
-            # 嘗試載入外部大字典
-            tokenizer.set_dictionary(dict_path)
-            tokenizer.initialize()
-            st.session_state['dict_status'] = f"✅ 成功載入繁體大字典: {Path(dict_path).name}"
-        except Exception as e:
-            # 若外部字典損壞 (例如 ValueError)，退回預設字典
-            tokenizer = jieba.Tokenizer() 
-            tokenizer.initialize()
-            st.session_state['dict_status'] = f"⚠️ 外部字典格式錯誤 ({e})，已退回 Jieba 預設字典"
-    else:
-        # 無外部字典，使用預設
-        tokenizer.initialize()
-        st.session_state['dict_status'] = "⚠️ 找不到外部字典，使用 Jieba 預設字典"
+@st.cache_resource(show_spinner='檢查並初始化中文斷詞字典…')
+def build_tokenizer(dict_path: str, userdict_path: str, dict_mtime: float):
+    """Do not allow a malformed uploaded dict.txt.big to crash the entire app.
 
-    # 若有使用者自訂字典，則疊加
-    if userdict_path and Path(userdict_path).is_file():
+    Valid entries: WORD INTEGER_FREQUENCY [POS]. No silent success badge on fallback.
+    """
+    diagnostics = []
+    chosen = None
+    if dict_path:
+        source = Path(dict_path)
+        invalid = []
+        valid = 0
+        # Some dictionaries copied from the web contain BOM, blank/comment lines,
+        # malformed frequencies, or even HTML. Validate *before* Jieba loads it.
+        import tempfile
+        import hashlib
+        digest = hashlib.sha256(str(source.resolve()).encode()).hexdigest()[:12]
+        clean_path = Path(tempfile.gettempdir()) / f'readingparallel_jieba_{digest}_{int(dict_mtime)}.txt'
         try:
-            tokenizer.load_userdict(userdict_path)
-        except Exception as e:
-            st.session_state['dict_status'] += f" | ❌ 自訂字典載入失敗 ({e})"
-            
-    return tokenizer
+            if not clean_path.exists():
+                with source.open('r', encoding='utf-8-sig') as src, clean_path.open('w', encoding='utf-8') as dst:
+                    for lineno, raw in enumerate(src, 1):
+                        row = raw.strip()
+                        if not row or row.startswith('#'):
+                            continue
+                        cols = row.split()
+                        if len(cols) not in (2, 3) or not cols[0] or not cols[1].isdigit():
+                            if len(invalid) < 5:
+                                invalid.append((lineno, row[:90]))
+                            continue
+                        dst.write(' '.join(cols) + '\n')
+                        valid += 1
+            else:
+                # Cached normalized file for current source mtime
+                with clean_path.open('r', encoding='utf-8') as fh:
+                    valid = sum(1 for _ in fh)
+            if invalid:
+                diagnostics.append(f'大字典有不符合 Jieba 格式的資料列，已略過。範例：{invalid}')
+            if valid < 1000:
+                diagnostics.append(f'大字典只有 {valid} 筆有效詞條，可能上傳了網頁 HTML 或錯誤檔案；已改用預設字典。')
+            else:
+                chosen = str(clean_path)
+        except (OSError, UnicodeError, ValueError) as e:
+            diagnostics.append(f'讀取繁體大字典失敗：{type(e).__name__}: {str(e)[:180]}。改用預設字典。')
 
-TOKENIZER = build_tokenizer(str(BIG_DICT) if BIG_DICT else '',
-                            str(USER_DICT) if USER_DICT.is_file() else '')
+    try:
+        tok = jieba.Tokenizer(dictionary=chosen)
+        tok.initialize()
+    except Exception as e:
+        diagnostics.append(f'Jieba 初始化失敗：{type(e).__name__}: {str(e)[:160]}。改用預設字典。')
+        chosen = None
+        tok = jieba.Tokenizer()
+        tok.initialize()
+    if userdict_path:
+        try:
+            tok.load_userdict(userdict_path)
+        except Exception as e:
+            diagnostics.append(f'自訂教學字典載入失敗：{type(e).__name__}: {str(e)[:120]}')
+    return tok, bool(chosen), diagnostics
+
+TOKENIZER, BIG_DICT_LOADED, DICT_WARNINGS = build_tokenizer(
+    str(BIG_DICT) if BIG_DICT else '',
+    str(USER_DICT) if USER_DICT.is_file() else '',
+    BIG_DICT.stat().st_mtime if BIG_DICT else 0.0,
+)
 
 PARTS = ['對話1', '對話2', '文章1', '文章2']
-HAN_RE = re.compile(r'[㐀-鿿]')
-CJK_WORD = re.compile(r'[㐀-鿿A-Za-z0-9]+')
+HAN_RE = re.compile(r'[\u3400-\u9fff]')
+CJK_WORD = re.compile(r'[\u3400-\u9fffA-Za-z0-9]+')
 PUNCT = re.compile(r'[，。！？；：「」『』、,.!?;:\s]+')
 
 st.set_page_config(page_title='高複現閱讀文本工作室', page_icon='📖', layout='wide')
-st.title('高複現華語閱讀文本工作室 · Python v1.1')
+st.title('高複現華語閱讀文本工作室 · Python v1.2')
 st.caption('教師選課 → 生成新文本 → Python 檢測 → 選擇性修訂 → 依定稿文本命題 → 檢核 → Word。LLM 請在外部使用，無需 API Key。')
+if BIG_DICT_LOADED:
+    st.success(f'繁體中文大字典已載入：{BIG_DICT.relative_to(HERE)}（{BIG_DICT.stat().st_size/1024/1024:.1f} MB）')
+else:
+    st.warning('繁體中文大字典未成功載入，目前使用 Jieba 預設字典；程式仍可執行。請檢查 dict.txt.big 是否為「原始文字」而非 GitHub 網頁。')
+for warning in DICT_WARNINGS:
+    st.warning(warning)
 
-# 顯示字典載入狀態
-st.info(st.session_state.get('dict_status', '初始化字典中...'))
 
 
 def uniq(xs):
@@ -85,8 +122,7 @@ def cleanbody(t):
     for line in t.strip().splitlines():
         if re.match(r'^\s*(?:【文本[一二三123]】|文本[一二三123]|教師備註|字數|複現率|來源|語法證據)',line):
             continue
-        line=re.sub(r'^\s*[^：:
-]{1,12}[：:]\s*', '',line)
+        line=re.sub(r'^\s*[^：:\n]{1,12}[：:]\s*', '',line)
         lines.append(line)
     return '\n'.join(lines)
 
@@ -237,7 +273,7 @@ with st.expander('生成提示詞',expanded=True):
 【原課文（僅供理解教學情境，禁止照搬）】\n{source}
 【任務】
 1. 新文本必須有明確不同於原課文的事件目的、重要資訊或結果；不能只更換人物姓名、地點或對話順序。
-​2. 可以沿用原課文人物，但避免創造未曾出現的人名。{('指定新情境：'+theme) if theme else '請自行提出有變化的新情境。'}
+2. 可以沿用原課文人物，但避免創造未曾出現的人名。{('指定新情境：'+theme) if theme else '請自行提出有變化的新情境。'}
 3. 每篇正文繁體中文（臺灣用語），長度約 {target_len[0]} 至 {target_len[1]} 個中文字，不含標題與說話者標籤。
 4. {('每篇需有相對完整的小事件，且篇幅相近；'+relation) if n>1 else '單篇需有完整的小事件。'}
 5. 本課應複現的生詞：{'、'.join(target)}。
