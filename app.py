@@ -24,28 +24,48 @@ USER_DICT = HERE / 'dictionaries' / 'teaching_words.txt'
 
 @st.cache_resource(show_spinner='初始化繁體中文斷詞字典…')
 def build_tokenizer(dict_path: str, userdict_path: str):
-    tokenizer = jieba.Tokenizer(dictionary=dict_path or None)
-    if userdict_path:
-        tokenizer.load_userdict(userdict_path)
-    tokenizer.initialize()
+    # 建立一個乾淨的 Tokenizer 實例
+    tokenizer = jieba.Tokenizer()
+    
+    if dict_path and Path(dict_path).is_file():
+        try:
+            # 嘗試載入外部大字典
+            tokenizer.set_dictionary(dict_path)
+            tokenizer.initialize()
+            st.session_state['dict_status'] = f"✅ 成功載入繁體大字典: {Path(dict_path).name}"
+        except Exception as e:
+            # 若外部字典損壞 (例如 ValueError)，退回預設字典
+            tokenizer = jieba.Tokenizer() 
+            tokenizer.initialize()
+            st.session_state['dict_status'] = f"⚠️ 外部字典格式錯誤 ({e})，已退回 Jieba 預設字典"
+    else:
+        # 無外部字典，使用預設
+        tokenizer.initialize()
+        st.session_state['dict_status'] = "⚠️ 找不到外部字典，使用 Jieba 預設字典"
+
+    # 若有使用者自訂字典，則疊加
+    if userdict_path and Path(userdict_path).is_file():
+        try:
+            tokenizer.load_userdict(userdict_path)
+        except Exception as e:
+            st.session_state['dict_status'] += f" | ❌ 自訂字典載入失敗 ({e})"
+            
     return tokenizer
 
 TOKENIZER = build_tokenizer(str(BIG_DICT) if BIG_DICT else '',
                             str(USER_DICT) if USER_DICT.is_file() else '')
 
 PARTS = ['對話1', '對話2', '文章1', '文章2']
-HAN_RE = re.compile(r'[\u3400-\u9fff]')
-CJK_WORD = re.compile(r'[\u3400-\u9fffA-Za-z0-9]+')
+HAN_RE = re.compile(r'[㐀-鿿]')
+CJK_WORD = re.compile(r'[㐀-鿿A-Za-z0-9]+')
 PUNCT = re.compile(r'[，。！？；：「」『』、,.!?;:\s]+')
 
 st.set_page_config(page_title='高複現閱讀文本工作室', page_icon='📖', layout='wide')
 st.title('高複現華語閱讀文本工作室 · Python v1.1')
 st.caption('教師選課 → 生成新文本 → Python 檢測 → 選擇性修訂 → 依定稿文本命題 → 檢核 → Word。LLM 請在外部使用，無需 API Key。')
-if BIG_DICT:
-    st.success(f'繁體中文大字典已啟用：{BIG_DICT.relative_to(HERE)}（{BIG_DICT.stat().st_size / 1024 / 1024:.1f} MB）', icon='✅')
-else:
-    st.warning('找不到 dict.txt.big。目前以 Jieba 預設字典斷詞；請將您下載的繁體大字典放入 GitHub 儲存庫根目錄（與 app.py 同層），即可自動啟用。', icon='⚠️')
 
+# 顯示字典載入狀態
+st.info(st.session_state.get('dict_status', '初始化字典中...'))
 
 
 def uniq(xs):
@@ -65,7 +85,8 @@ def cleanbody(t):
     for line in t.strip().splitlines():
         if re.match(r'^\s*(?:【文本[一二三123]】|文本[一二三123]|教師備註|字數|複現率|來源|語法證據)',line):
             continue
-        line=re.sub(r'^\s*[^：:\n]{1,12}[：:]\s*', '',line)
+        line=re.sub(r'^\s*[^：:
+]{1,12}[：:]\s*', '',line)
         lines.append(line)
     return '\n'.join(lines)
 
@@ -216,7 +237,7 @@ with st.expander('生成提示詞',expanded=True):
 【原課文（僅供理解教學情境，禁止照搬）】\n{source}
 【任務】
 1. 新文本必須有明確不同於原課文的事件目的、重要資訊或結果；不能只更換人物姓名、地點或對話順序。
-2. 可以沿用原課文人物，但避免創造未曾出現的人名。{('指定新情境：'+theme) if theme else '請自行提出有變化的新情境。'}
+​2. 可以沿用原課文人物，但避免創造未曾出現的人名。{('指定新情境：'+theme) if theme else '請自行提出有變化的新情境。'}
 3. 每篇正文繁體中文（臺灣用語），長度約 {target_len[0]} 至 {target_len[1]} 個中文字，不含標題與說話者標籤。
 4. {('每篇需有相對完整的小事件，且篇幅相近；'+relation) if n>1 else '單篇需有完整的小事件。'}
 5. 本課應複現的生詞：{'、'.join(target)}。
