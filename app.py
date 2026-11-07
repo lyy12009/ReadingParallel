@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""ReadingParallel Python v2.0: single JSON handoff from LLM to editable Word output."""
+"""ReadingParallel Python v2.1: multilingual glossary, single JSON to Word."""
 from __future__ import annotations
 import io
 import json
@@ -433,9 +433,15 @@ def write_docx(text, quiz, answer, title, glossary_text='', teacher_version=Fals
         heading('閱讀前補充生詞')
         # 短生詞兩欄，較長解釋自然換行；不以全形空格硬撐欄距。
         for i in range(0,len(items),2):
+            # Multilingual definitions are wide: give them full text width.
+            if any('；' in m for _,m in items):
+                break
             vals=[f'{w}：{m}' if m else w for w,m in items[i:i+2]]
             vals += ['']*(2-len(vals))
             choice_row(vals)
+        if any('；' in m for _,m in items):
+            for w,m in items:
+                line(f'{w}：{m}' if m else w,after=3)
 
     heading('閱讀文本')
     content=[x.strip() for x in text.strip().splitlines() if x.strip()]
@@ -609,8 +615,14 @@ def parse_learning_json(raw):
     if not isinstance(texts,list) or not texts or not all(isinstance(x,dict) and isinstance(x.get('content'),str) and x['content'].strip() for x in texts):
         raise ValueError('reading_texts 必須是至少一篇、且每篇有 content 的陣列。')
     vocab=data.get('supplementary_vocabulary',[])
-    if not isinstance(vocab,list) or not all(isinstance(x,dict) and isinstance(x.get('word'),str) and isinstance(x.get('explanation'),str) for x in vocab):
-        raise ValueError('supplementary_vocabulary 應為 {word, explanation} 的陣列。')
+    if not isinstance(vocab,list) or not all(
+        isinstance(x,dict) and isinstance(x.get('word'),str) and (
+            isinstance(x.get('explanation'),str) or (
+                isinstance(x.get('explanation'),dict) and
+                all(isinstance(k,str) and isinstance(v,str) for k,v in x['explanation'].items())
+            )
+        ) for x in vocab):
+        raise ValueError('supplementary_vocabulary 需有 word 與 explanation；explanation 可為文字或語言對照物件。')
     questions=data.get('questions',[])
     if not isinstance(questions,list):
         raise ValueError('questions 必須是陣列。')
@@ -644,7 +656,11 @@ def questions_to_text(items):
 def json_to_editors(data):
     texts=data['reading_texts']
     body='\n\n'.join((f"{t.get('title','').strip()}\n" if t.get('title','').strip() else '')+t['content'].strip() for t in texts)
-    vocab='\n'.join(f"{v['word'].strip()}：{v['explanation'].strip()}" for v in data.get('supplementary_vocabulary',[]) if v['word'].strip())
+    def meaning_text(explanation):
+        if isinstance(explanation,dict):
+            return '；'.join(f'{language}：{meaning.strip()}' for language,meaning in explanation.items() if meaning.strip())
+        return explanation.strip()
+    vocab='\n'.join(f"{v['word'].strip()}：{meaning_text(v['explanation'])}" for v in data.get('supplementary_vocabulary',[]) if v['word'].strip())
     answers='\n'.join(f"{i}. {q.get('answer','').strip()}" for i,q in enumerate(data['questions'],1))
     return {'v2_title':data.get('title','閱讀測驗').strip() or '閱讀測驗',
             'v2_body':body, 'v2_vocab':vocab,
@@ -704,7 +720,14 @@ with st.sidebar:
     quiz_type=st.selectbox('題型',['單選題','是非題','簡答題','事件排序','混合題型'])
     quiz_qty=st.selectbox('題數',[3,4,5,6],index=0)
     quiz_focus=st.selectbox('閱讀理解重點',['訊息擷取與理解','推論與整合','混合'])
-    quiz_extra=st.text_area('教師指定命題方向（選填）',placeholder='例如：人物改變決定的原因、結局的差異',height=65)
+    glossary_languages=st.multiselect(
+        '補充生詞解釋語言（可多選）',
+        ['繁體中文（臺灣）','English（英語）','Tiếng Việt（越南語）','Bahasa Indonesia（印尼語）','日本語（日語）','ภาษาไทย（泰語）','한국어（韓語）','Filipino（菲律賓語）','Español（西班牙語）'],
+        default=['English（英語）'],
+        help='可選多種母語；每個補充詞依所選語言各提供一個簡短解釋。正文、題目及作答說明仍是繁體中文。')
+    if not glossary_languages:
+        st.warning('請至少選擇一種補充生詞解釋語言。')
+    glossary_language_text='、'.join(glossary_languages)
 
 
 source=lesson[reference]; target=words(lesson,[reference]); gtarget=grammar(lesson,[reference])
@@ -828,7 +851,7 @@ else:
     difference_text='\n'.join(f"- 原：{v['原文片段']} / 新：{v['新文本片段']}" for v in changes) or '無明顯差異'
     retained=st.session_state.get('approved_retained',[])
     st.write(f'命題設定：{quiz_basis}；{quiz_type}；{quiz_qty} 題；重點：{quiz_focus}')
-    st.caption('教師保留的補充生詞會直接交給 LLM 產生簡短釋義，不需於第四階段再逐詞輸入。')
+    st.caption(f'教師保留詞會以所選語言（{glossary_language_text or None}）分別提供簡短釋義；原詞仍是繁體中文。')
     if quiz_basis=='依閱讀理解目標':
         change_instruction='依新文本閱讀理解重點命題，不需要參照原課文。'
         difference_section=''
@@ -839,11 +862,12 @@ else:
 【已定稿閱讀文本（必須原樣保留，不得續寫）】
 {final}
 【教師保留的新詞（只解釋這些詞，不要自行增加）】{'、'.join(retained) or '無'}
+【補充生詞解釋語言（每種都要提供）】{glossary_language_text or "English（英語）"}。supplementary_vocabulary 中 explanation 必須是 JSON 物件：以本次所選語言的完整名稱為鍵，以各語言簡短、準確、通順的釋義為值；不得缺少其中任何一種語言，也不得加入未選語言。word 保留繁體中文。切勿用較難的華語解釋初級詞；若教師選了繁體中文，必須優先使用已學的簡單詞。閱讀正文、題幹、選項、作答說明維持繁體中文。
 {difference_section}
 【命題】{quiz_type}，共 {quiz_qty} 題；理解重點：{quiz_focus}；依據：{quiz_basis}；補充：{quiz_extra or '無'}。
 {change_instruction} 題目必須以新文本為唯一作答依據，不要求學生比較原課文。題幹、作答說明及選項使用已學程度的繁體中文。單選題必有 A–D 四個選項、僅一正確答案；是非／簡答／排序題則提供相應答案。不可創造新故事、列詞彙來源或提供解析。
 【JSON 結構】必須使用以下鍵名與型別，questions 長度必須等於 {quiz_qty}：
-{{"title":"閱讀測驗","reading_texts":[{{"title":"文本一標題","content":"原樣保留的完整正文"}}],"supplementary_vocabulary":[{{"word":"教師保留詞","explanation":"以初級已學詞寫的短解釋"}}],"instructions":"簡短作答說明","questions":[{{"type":"single_choice / true_false / short_answer / ordering","stem":"實際題幹","options":["選項文字 A","選項文字 B","選項文字 C","選項文字 D"],"answer":"A"}}]}}
+{{"title":"閱讀測驗","reading_texts":[{{"title":"文本一標題","content":"原樣保留的完整正文"}}],"supplementary_vocabulary":[{{"word":"教師保留詞","explanation":{{"所選語言一":"解釋一","所選語言二":"解釋二"}}}}],"instructions":"簡短作答說明","questions":[{{"type":"single_choice / true_false / short_answer / ordering","stem":"實際題幹","options":["選項文字 A","選項文字 B","選項文字 C","選項文字 D"],"answer":"A"}}]}}
 reading_texts 必須包含全部定稿文本（{n} 篇）；補充生詞若無則輸出空陣列。選項內容不加 A. 等前綴（程式會補）；沒有選項的題型用空陣列。answer 只寫簡短答案。輸出務必能由 Python json.loads 直接解析。'''
     format_prompt(prompt3)
     with st.expander('檢視新舊文本差異線索（供教師核對）'):
@@ -883,7 +907,7 @@ if st.session_state.get('v2_loaded'):
     st.markdown('**可編輯的 Word 內容**')
     title=st.text_input('文件標題',key='v2_title')
     body=st.text_area('閱讀文本（可修改）',height=220,key='v2_body')
-    vocab=st.text_area('閱讀前補充生詞及解釋（可修改或刪除）',height=100,key='v2_vocab',help='由第二階段教師核准詞建立，第三階段 LLM 補上解釋；每行：詞語：解釋。')
+    vocab=st.text_area('閱讀前補充生詞及解釋（可修改或刪除）',height=100,key='v2_vocab',help=f'解釋語言：{glossary_language_text}。由第二階段核准詞建立，多語解釋會自動整理成同一筆詞條；教師可直接修改。')
     show_vocab=st.checkbox('在學生版及教師版列印補充生詞',key='v2_show_vocab')
     instructions=st.text_area('作答說明（可修改）',height=65,key='v2_instructions')
     questions=st.text_area('閱讀理解題目及選項（可修改）',height=240,key='v2_questions')
@@ -916,4 +940,4 @@ if st.session_state.get('v2_loaded'):
 else:
     st.info('請先貼入 JSON 並按解析；也可以先載入第二階段的定稿閱讀文本。')
 
-st.caption('v2.0：第三階段輸出 JSON；第四階段一次匯入、編輯與 Word 匯出。沿用 v1.7 的 Word 題組排版及既有 Jieba 檢測。')
+st.caption('v2.1：第三階段輸出 JSON；第四階段一次匯入、編輯與 Word 匯出。沿用 v1.7 的 Word 題組排版及既有 Jieba 檢測。')
