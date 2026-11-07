@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""ReadingParallel Python v1.3: independent teacher-in-the-loop LLM prompt + audit app."""
+"""ReadingParallel Python v1.5: independent teacher-in-the-loop LLM prompt + audit app."""
 from __future__ import annotations
 import io
 import json
@@ -94,7 +94,7 @@ CJK_WORD = re.compile(r'[\u3400-\u9fffA-Za-z0-9]+')
 PUNCT = re.compile(r'[，。！？；：「」『』、,.!?;:\s]+')
 
 st.set_page_config(page_title='高複現閱讀文本工作室', page_icon='📖', layout='wide')
-st.title('高複現華語閱讀文本工作室 · Python v1.3')
+st.title('高複現華語閱讀文本工作室 · Python v1.5')
 st.caption('教師選課 → 生成新文本 → Python 檢測 → 選擇性修訂 → 依定稿文本命題 → 檢核 → Word。LLM 請在外部使用，無需 API Key。')
 if BIG_DICT_LOADED:
     st.success(f'繁體中文大字典已載入：{BIG_DICT.relative_to(HERE)}（{BIG_DICT.stat().st_size/1024/1024:.1f} MB）')
@@ -151,6 +151,74 @@ def get_lexicon(upto):
     return known
 
 
+def names_from_dialogue(text):
+    """只擷取明確的對話說話者標籤；不猜測內文中的姓名。"""
+    return uniq(m.group(1) for line in text.splitlines()
+                if (m := re.match(r'^\s*([^：:，。！？\s]{1,8})[：:]', line))
+                and not re.match(r'^(?:文本|老師|教師備註)\d*$', m.group(1)))
+
+
+def known_names(upto):
+    return uniq(name for d in DATA[:upto+1] for part in PARTS
+                for name in names_from_dialogue(d.get(part,'')) + explicit_names_from_source(d.get(part,'')))
+
+
+def explicit_names_from_source(source):
+    """可確定的自我介紹句型；其他人名請教師確認，不自行臆測。"""
+    candidates=[]
+    for pat in (r'我是([\u3400-\u9fff]{2,4})(?=[。！？，])',
+                r'我叫([\u3400-\u9fff]{2,4})(?=[。！？，])',
+                r'這是([\u3400-\u9fff]{2,4})(?=先生|小姐|。|，)',):
+        candidates.extend(re.findall(pat,source))
+    return uniq(candidates)
+
+
+@st.cache_data(show_spinner=False)
+def lesson_segmented_corpus(upto: int, dict_version: str):
+    """重建至目標課為止的全課文分詞集合；不同於本課生詞表。
+
+    現有 corpus.json 未保存原始教材斷詞欄位，這是依課文及指定 Jieba 字典
+    的可重現重建，不應冒稱原始人工校訂分詞資料。
+    """
+    from_text=set()
+    source_sentences=[]
+    for d in DATA[:upto+1]:
+        for part in PARTS:
+            raw=d.get(part,'')
+            for line in raw.splitlines():
+                # 除去說話者標記，保留正文、避免姓名干擾詞庫
+                body=re.sub(r'^\s*[^：:\n]{1,12}[：:]\s*', '',line)
+                for sentence in re.split(r'[，。！？；：、,.!?;：\s]+',body):
+                    sentence=sentence.strip()
+                    if not sentence: continue
+                    source_sentences.append(sentence)
+                    from_text.update(w for w in TOKENIZER.lcut(sentence,HMM=False) if HAN_RE.search(w))
+    return from_text, tuple(source_sentences)
+
+
+def curriculum_evidence(upto):
+    """截至目標課：全課文斷詞（主要已學集合）＋語法例句詞彙。"""
+    version=f'{BIG_DICT}:{BIG_DICT.stat().st_mtime if BIG_DICT else 0}'
+    from_text,source_sentences=lesson_segmented_corpus(upto,version)
+    from_grammar=set()
+    grammar_sentences=[]
+    for d in DATA[:upto+1]:
+        for part in PARTS:
+            for g in d.get(part+'語法點',[]):
+                example=g.split('：',1)[1].strip() if '：' in g else ''
+                if example:
+                    grammar_sentences.extend(x for x in re.split(r'[，。！？；：、,.!?;\s]+',example) if x)
+                    from_grammar.update(w for w in TOKENIZER.lcut(example,HMM=False) if HAN_RE.search(w))
+                    # 短語如「貴姓」可能被 Jieba 拆成單字；連續出現即應有教材證據。
+                    if '貴姓' in example: from_grammar.add('貴姓')
+    return from_text, from_grammar, source_sentences, tuple(grammar_sentences)
+
+
+def speaker_warnings(text,approved_names):
+    allowed=set(approved_names)
+    return [n for n in names_from_dialogue(text) if n not in allowed]
+
+
 def _curriculum_segment(fragment, by_first):
     """教材詞庫優先的最長比對；剩餘片段交 Jieba 斷詞。
     避免以已學單字拼出未教過的雙字詞，故已學單字不參與優先比對。
@@ -170,8 +238,13 @@ def _curriculum_segment(fragment, by_first):
     return out
 
 
-def audit(text,known,target,original,allow):
-    baseline=set(known)|set(allow)
+def audit(text,known,target,original,allow,text_evidence=None,grammar_evidence=None,names=None,attested_phrases=None):
+    text_evidence=set(text_evidence or [])
+    grammar_evidence=set(grammar_evidence or [])
+    names=set(names or [])
+    attested_phrases=tuple(attested_phrases or ())
+    # 先處理教材證據、語法例句及核准人名，再進入超綱檢測。
+    baseline=set(known)|set(allow)|text_evidence|grammar_evidence|names
     # 優先使用教材已學詞彙配合繁體大字典；局部 tokenizer 避免不同使用者互相污染。
     # 第一次初始化採專案字典，逐份文本用同一個全局只讀詞庫。
     normalized=cleanbody(text)
@@ -185,16 +258,24 @@ def audit(text,known,target,original,allow):
     # Lexicon-based greedy scan prioritizes explicit known multi-character words.
     # Does not infer that individual known characters license a new compound word.
     unknown=Counter()
+    evidence_counts=Counter()
     counts={w:len(re.findall(re.escape(w), normalized)) for w in target}
     known_set=baseline | set('的一了是不我你他她們嗎呢啊有在和也都很去來說要會')
     for w in tokens:
-        if HAN_RE.search(w) and w not in known_set:
-            unknown[w]+=1
+        if not HAN_RE.search(w):
+            continue
+        if w in names: evidence_counts['教師確認人名'] += 1
+        elif w in known: evidence_counts['已學生詞'] += 1
+        elif w in grammar_evidence: evidence_counts['語法例句'] += 1
+        elif w in text_evidence or (len(w)>1 and any(w in phrase for phrase in attested_phrases)): evidence_counts['已學課文連續用詞'] += 1
+        elif w in allow: evidence_counts['教師允許詞'] += 1
+        elif w in known_set: evidence_counts['常見功能詞'] += 1
+        else: unknown[w]+=1
     overlap,examples=ngram_overlap(original,text)
     old=normalize_text(original); new=normalize_text(text)
     sim=SequenceMatcher(None,old,new,autojunk=False).ratio() if old and new else 0
     return {'字數':count_han(text),'目標詞複現':counts,'疑似超綱':unknown,'疑似超綱詞次':sum(unknown.values()),
-            '全文中文字詞次':sum(1 for w in tokens if HAN_RE.search(w)),
+            '全文中文字詞次':sum(1 for w in tokens if HAN_RE.search(w)), '已學證據分類':evidence_counts,
             '原文連續片段重合率':overlap,'整體字元相似度':sim,'重合片段':examples}
 
 
@@ -241,6 +322,8 @@ def glossary_lines(text):
 def write_docx(text, quiz, answer, title, glossary_text='', teacher_version=False):
     doc=Document()
     sec=doc.sections[0]
+    sec.page_width=Cm(21)
+    sec.page_height=Cm(29.7)
     sec.top_margin=sec.bottom_margin=Cm(2.2)
     sec.left_margin=sec.right_margin=Cm(2.3)
     styles=doc.styles
@@ -316,10 +399,10 @@ def extract_quiz_language(quiz):
     return '\n'.join(heads), '\n'.join(choices)
 
 
-def audit_quiz_language(quiz, known, allow):
+def audit_quiz_language(quiz, known, allow, text_evidence=None, grammar_evidence=None, names=None, attested_phrases=None):
     question_stems, choices=extract_quiz_language(quiz)
-    r1=audit(question_stems,known,[], '',allow)
-    r2=audit(choices,known,[], '',allow)
+    r1=audit(question_stems,known,[], '',allow,text_evidence,grammar_evidence,names,attested_phrases)
+    r2=audit(choices,known,[], '',allow,text_evidence,grammar_evidence,names,attested_phrases)
     return {'題幹與說明':r1,'選項':r2}
 
 
@@ -359,6 +442,17 @@ with st.sidebar:
     target_len={'依整課課文總長度':(max(30,round(whole_len*.8)),max(40,round(whole_len*1.2))), '100–150':(100,150),'200–300':(200,300),'400–500':(400,500)}[length]
     cover=st.selectbox('本次目標詞覆蓋需求',['自然度優先','每篇至少60%','每篇至少80%'])
     theme=st.text_input('新情境／主題（選填）', placeholder='例如：從機場接人改為在校園第一次見面')
+    st.subheader('人物姓名（生成前先確認）')
+    st.caption('可選截至本課所有已出現的名字（含前面各課），不限制當課人名；教師也可自行增加。')
+    source_people=names_from_dialogue(lesson[reference])
+    historical_people=known_names(idx)
+    selected_names=st.multiselect('允許使用的教材說話者',historical_people,
+                                  default=[n for n in source_people if n in historical_people],
+                                  key=f'names_{idx}_{reference}')
+    manual_names_raw=st.text_area('其他允許人名（每行一人，選填；也可填教材中的完整姓名）',
+                                  value='\n'.join(explicit_names_from_source(lesson[reference])),height=75,
+                                  key=f'extra_names_{idx}_{reference}')
+    approved_names=uniq(selected_names+re.split(r'[,，、\n]+',manual_names_raw))
     allowed_raw=st.text_area('教師允許保留的額外詞（可選，每行一詞）',height=75)
     allowed=uniq(re.split(r'[,，、\n]+',allowed_raw))
     st.divider()
@@ -372,17 +466,20 @@ with st.sidebar:
 
 source=lesson[reference]; target=words(lesson,[reference]); gtarget=grammar(lesson,[reference])
 known=get_lexicon(idx)
+text_evidence, grammar_evidence, original_sentences, grammar_sentences=curriculum_evidence(idx)
+attested_phrases=original_sentences+grammar_sentences
 current_key=f'{idx}:{reference}:{form}:{n}'
 if st.session_state.get('active_key')!=current_key:
     st.session_state['active_key']=current_key
-    for k in ['draft','final_text','quiz_text','answer_text','approved','last_audit','audited_text','retained_words','glossary_editor','quiz_allowed_raw']:
+    for k in ['draft','final_text','quiz_text','answer_text','approved','last_audit','audited_text','retained_words','glossary_editor','quiz_allowed_raw','audited_names']:
         st.session_state.pop(k,None)
 
 with st.expander('查看教材來源與複現目標',expanded=False):
     st.write('**原課文：**');st.text(source)
     st.write('**當課目標生詞：**','、'.join(target) or '（原文未載）')
     st.write('**當課目標語法：**','；'.join(gtarget) or '（原文未載）')
-    st.caption(f'截至本課累積生詞：{len(known)} 項；整課課文字數約 {whole_len} 字。來源文本可能有人名或教材編排瑕疵，須由教師核對。')
+    st.caption(f'截至本課：全課文重建斷詞 {len(text_evidence)} 項（主要已學比對集合）；生詞表 {len(known)} 項（複現目標來源）；語法例句 {len(grammar_evidence)} 項；整課字數約 {whole_len} 字。')
+    st.info('目前 JSON 未保留原始人工校訂的全課斷詞清單；此處從完整課文使用本專案 Jieba 字典重建。若您有原始斷詞 JSON，可再替換。')
 
 st.subheader('第一階段｜生成真正的新文本')
 with st.expander('生成提示詞',expanded=True):
@@ -391,7 +488,7 @@ with st.expander('生成提示詞',expanded=True):
 【原課文（僅供理解教學情境，禁止照搬）】\n{source}
 【任務】
 1. 新文本必須有明確不同於原課文的事件目的、重要資訊或結果；不能只更換人物姓名、地點或對話順序。
-2. 可以沿用原課文人物，但避免創造未曾出現的人名。{('指定新情境：'+theme) if theme else '請自行提出有變化的新情境。'}
+2. 只可使用下列教師已確認的人名／說話者：{'、'.join(approved_names) or '無（請使用無人名的文章）'}。不得新增姓名或自創說話者；如果需要代稱，可用已學的『我、你、他、她』。{('指定新情境：'+theme) if theme else '請自行提出有變化的新情境。'}
 3. 每篇正文繁體中文（臺灣用語），長度約 {target_len[0]} 至 {target_len[1]} 個中文字，不含標題與說話者標籤。
 4. {('每篇需有相對完整的小事件，且篇幅相近；'+relation) if n>1 else '單篇需有完整的小事件。'}
 5. 本課應複現的生詞：{'、'.join(target)}。
@@ -409,18 +506,23 @@ if st.button('執行 Python 檢測',type='primary'):
     if not raw:
         st.warning('請先貼入文本。')
     else:
-        report=audit(raw,known,target,source,allowed)
+        report=audit(raw,known,target,source,allowed,text_evidence,grammar_evidence,approved_names,attested_phrases)
+        report['未核准說話者']=speaker_warnings(raw,approved_names) if form=='對話' else []
         st.session_state['last_audit']=report
         st.session_state['audited_text']=raw
+        st.session_state['audited_names']=tuple(sorted(approved_names))
         st.session_state['approved']=False
 report=st.session_state.get('last_audit')
 if report:
     c1,c2,c3,c4=st.columns(4)
     c1.metric('正文中文字數',report['字數'])
     c2.metric('目標詞至少出現一次',f"{sum(bool(v) for v in report['目標詞複現'].values())}/{len(target)}")
-    c3.metric('疑似超綱詞次',report['疑似超綱詞次'])
+    c3.metric('教材未收錄詞次',report['疑似超綱詞次'])
     c4.metric('與原文相似度',f"{report['整體字元相似度']:.0%}")
-    st.caption('以上為程式文字檢測，不是教學效度驗證。超綱結果可能受分詞、人名、課文已學但未列生詞及語法例句影響。')
+    st.caption('先採截至本課的全課文斷詞與課文連續用詞，再對照生詞表、語法例句、歷來已學人名與教師允許詞。未找到的項目仍需核對。')
+    st.write('**檢測依據統計：**', '；'.join(f'{k} {v} 詞次' for k,v in report['已學證據分類'].items()))
+    if report['未核准說話者']:
+        st.error('出現未經教師核准的說話者：'+'、'.join(report['未核准說話者'])+'。請先改名、調整允許名單，然後重新檢測。')
     if report['原文連續片段重合率']>.25 or report['整體字元相似度']>.7:
         st.error('與原課文的相似度偏高：請人工確認是否只是在照搬、少量改寫或延續原對話。')
     if not(target_len[0]<=report['字數']<=target_len[1]*n):
@@ -430,7 +532,7 @@ if report:
         st.markdown('**目標詞複現次數**')
         st.dataframe([{'生詞':w,'次數':v} for w,v in report['目標詞複現'].items()],hide_index=True,use_container_width=True)
     with right:
-        st.markdown('**疑似超綱詞（需教師核對）**')
+        st.markdown('**教材詞庫未收錄詞（待核對）**')
         st.dataframe([{'詞':w,'次數':v} for w,v in report['疑似超綱'].most_common()],hide_index=True,use_container_width=True)
     st.markdown('**保留少量超綱詞，作為閱讀前補充生詞**')
     st.caption('大量閱讀可以接觸少量尚未教過、但有助於理解的詞。勾選保留不代表已學；教師可在下方為學生提供簡短解釋。')
@@ -458,9 +560,10 @@ if report:
         format_prompt(prompt2)
     st.markdown('**教師確認定稿**')
     st.caption('檢測後如要人工修改，請重新檢測。確認前不能進行命題。')
-    if st.session_state.get('audited_text') != st.session_state.get('draft'):
-        st.warning('文本已在上次檢測後修改，請先重新檢測。')
-    if st.button('將目前檢測內容確認為定稿', disabled=st.session_state.get('audited_text') != st.session_state.get('draft')):
+    names_changed=st.session_state.get('audited_names') != tuple(sorted(approved_names))
+    if st.session_state.get('audited_text') != st.session_state.get('draft') or names_changed:
+        st.warning('文本或核准人名已在上次檢測後變更，請重新檢測。')
+    if st.button('將目前檢測內容確認為定稿', disabled=(st.session_state.get('audited_text') != st.session_state.get('draft') or names_changed or bool(report['未核准說話者']))):
         st.session_state['final_text']=st.session_state['draft']
         st.session_state['approved']=True
         st.session_state['quiz_text']=''
@@ -521,24 +624,24 @@ else:
     st.caption('閱讀正文可以保留經教師同意的超綱詞；測驗文字須另行檢測。題幹與選項分開統計，並非以閱讀正文是否通過代替。')
     quiz_allowed_raw=st.text_area('測驗專用允許詞（每行一詞；選填）',height=65,key='quiz_allowed_raw',placeholder='例如：已在閱讀前補充且學生能理解的必要詞')
     quiz_allowed=uniq(re.split(r'[,，、\n]+',quiz_allowed_raw))
-    quiz_language=audit_quiz_language(quiz_student,known,allowed+quiz_allowed)
+    quiz_language=audit_quiz_language(quiz_student,known,allowed+quiz_allowed,text_evidence,grammar_evidence,approved_names,attested_phrases)
     stems_bad=quiz_language['題幹與說明']['疑似超綱']
     choices_bad=quiz_language['選項']['疑似超綱']
     if quiz_student.strip():
         c_stem,c_choice=st.columns(2)
         with c_stem:
-            st.metric('題幹／說明疑似超綱詞次',sum(stems_bad.values()))
+            st.metric('題幹／說明未收錄詞次',sum(stems_bad.values()))
             if stems_bad:
                 st.dataframe([{'疑似超綱詞':w,'次數':c} for w,c in stems_bad.most_common()],hide_index=True,use_container_width=True)
             else:
                 st.success('目前未標記題幹或說明的疑似超綱詞。')
         with c_choice:
-            st.metric('選項疑似超綱詞次',sum(choices_bad.values()))
+            st.metric('選項未收錄詞次',sum(choices_bad.values()))
             if choices_bad:
                 st.dataframe([{'疑似超綱詞':w,'次數':c} for w,c in choices_bad.most_common()],hide_index=True,use_container_width=True)
             else:
                 st.success('目前未標記選項的疑似超綱詞。')
-        st.caption('此為教材詞庫與 Jieba 的比對警示，可能包含常用功能詞、人名及斷詞誤判；教師可修改題目或於上方允許詞欄確認保留。')
+        st.caption('已先扣除生詞表、已學課文、語法例句與核准人名；剩餘為教材未收錄詞候選，仍須教師依語境核對。')
         with st.expander('複製：測驗題目專用修訂 Prompt'):
             format_prompt(quiz_revision_prompt(quiz_student,issues,list(stems_bad),list(choices_bad),final,quiz_type,quiz_qty,quiz_allowed))
     if st.button('檢查題目完整性與語言難度'):
@@ -548,27 +651,49 @@ else:
             st.success(f'已辨識 {len(found)} 題，通過基本形式檢查。仍須由教師核對答案、干擾選項與語言難度。')
         else:
             for issue in issues: st.warning(issue)
-    st.divider()
-    st.subheader('第四階段｜補充生詞、編排與匯出 Word')
-    st.caption('閱讀前補充生詞是可選的。只收入教師確認需要解釋的詞，不自動列出所有疑似超綱詞。')
-    approved_retained=st.session_state.get('approved_retained',[])
-    if 'glossary_editor' not in st.session_state:
-        st.session_state['glossary_editor']='\n'.join(f'{w}：' for w in approved_retained)
-    glossary=st.text_area('學生版補充生詞（每行「詞語：簡短解釋」；可刪除不需要的詞）',key='glossary_editor',height=115)
-    show_glossary=st.checkbox('將補充生詞印在閱讀文本之前',value=bool(approved_retained))
-    doc_title=st.text_input('文件標題',value=f"{book}{lesson['課']} 閱讀測驗")
-    st.caption('學生版：標題、補充生詞（選用）、閱讀文本、測驗題。教師版在最後另附答案頁。頁面邊界與字級已設定，可於 Word 調整 A4 紙張與列印。')
-    if not quiz_student.strip():
-        st.info('尚未貼入測驗題。目前可先下載「只有閱讀文本」的版本；完成測驗後再輸出完整講義。')
-    if issues and quiz_student.strip():
-        st.warning('題目形式檢測仍有提醒，建議先修正再印發。')
-    export_glossary=glossary if show_glossary else ''
-    student_doc=write_docx(final,quiz_student,'',doc_title,export_glossary,False)
-    teacher_doc=write_docx(final,quiz_student,output_answer,doc_title,export_glossary,True)
+
+st.divider()
+st.subheader('第四階段｜編輯與匯出 Word（隨時可用）')
+st.caption('即使命題尚未完成，也可先匯出閱讀文本；完成命題後，將題目貼到下方即可匯出完整學生版與教師版。')
+# 不能把尚未定稿的舊文本誤認為正式定稿；提供可編輯的匯出欄位。
+if st.session_state.get('approved'):
+    export_default=st.session_state.get('final_text','')
+else:
+    export_default=st.session_state.get('draft','')
+if st.session_state.get('word_source')!=export_default and not st.session_state.get('word_customized'):
+    st.session_state['word_body']=export_default
+    st.session_state['word_source']=export_default
+export_body=st.text_area('Word 閱讀正文（可直接編輯；未定稿時請自行確認內容）',key='word_body',height=230)
+if st.session_state.get('word_source')!=export_body:
+    st.session_state['word_customized']=True
+quiz_for_word=st.session_state.get('quiz_text','')
+quiz_for_word=re.split(r'教師答案\s*[:：]?\s*',quiz_for_word,maxsplit=1)[0]
+if st.session_state.get('word_quiz_source')!=quiz_for_word and not st.session_state.get('word_quiz_customized'):
+    st.session_state['word_quiz']=quiz_for_word
+    st.session_state['word_quiz_source']=quiz_for_word
+export_quiz=st.text_area('Word 測驗題目（可直接貼入或修改）',key='word_quiz',height=220)
+if st.session_state.get('word_quiz_source')!=export_quiz:
+    st.session_state['word_quiz_customized']=True
+export_answers=st.text_area('教師答案（僅教師版收錄）',value=st.session_state.get('answer_editor',''),height=90,key='word_answers')
+if not st.session_state.get('word_glossary_loaded'):
+    st.session_state['word_glossary']='\n'.join(f'{w}：' for w in st.session_state.get('approved_retained',[]))
+    st.session_state['word_glossary_loaded']=True
+export_glossary=st.text_area('閱讀前補充生詞（選填，每行：詞語：解釋）',key='word_glossary',height=100)
+show_glossary=st.checkbox('在學生版與教師版列印補充生詞',value=bool(export_glossary.strip()))
+doc_title=st.text_input('文件標題',value=f"{book}{lesson['課']} 閱讀測驗",key='word_title')
+if not export_body.strip():
+    st.warning('請先貼入閱讀正文才可下載 Word。')
+else:
+    if not export_quiz.strip():
+        st.info('目前只有閱讀正文，下載的是閱讀文本；命題後可再下載含測驗題的完整 Word。')
+    if not st.session_state.get('approved'):
+        st.caption('目前尚未完成教師定稿，下載前請檢查文本內容。')
+    student_doc=write_docx(export_body,export_quiz,'',doc_title,export_glossary if show_glossary else '',False)
+    teacher_doc=write_docx(export_body,export_quiz,export_answers,doc_title,export_glossary if show_glossary else '',True)
     a,b=st.columns(2)
     with a:
-        st.download_button('下載學生版 Word（無答案）',data=student_doc,file_name='ReadingParallel_學生版.docx',mime='application/vnd.openxmlformats-officedocument.wordprocessingml.document')
+        st.download_button('下載學生版 Word（無答案）',data=student_doc,file_name='ReadingParallel_學生版.docx',mime='application/vnd.openxmlformats-officedocument.wordprocessingml.document',key='word_student_download')
     with b:
-        st.download_button('下載教師版 Word（附答案）',data=teacher_doc,file_name='ReadingParallel_教師版.docx',mime='application/vnd.openxmlformats-officedocument.wordprocessingml.document')
+        st.download_button('下載教師版 Word（附答案）',data=teacher_doc,file_name='ReadingParallel_教師版.docx',mime='application/vnd.openxmlformats-officedocument.wordprocessingml.document',key='word_teacher_download')
 
-st.caption('版本說明：疑似超綱檢測為繁體大字典（可用時）＋ Jieba 斷詞＋教材詞庫優先匹配＋截至本課生詞表比對，不等於完整已學詞庫。人名、功能詞、句法、自然度及複現適切性需要教師審查；目前不自動呼叫付費 API。')
+st.caption('v1.5：先以截至目標課的全課文重建斷詞集合核對已學詞；生詞表另作複現目標；人名累積前面各課。第四階段 Word 可獨立使用。無需 LLM API。')
