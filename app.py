@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""ReadingParallel Python v1.7: independent teacher-in-the-loop LLM prompt + audit app."""
+"""ReadingParallel Python v1.8: teacher-approved guiding words for new parallel texts."""
 from __future__ import annotations
 import io
 import json
@@ -586,6 +586,17 @@ with st.sidebar:
     target_len={'依整課課文總長度':(max(30,round(whole_len*.8)),max(40,round(whole_len*1.2))), '100–150':(100,150),'200–300':(200,300),'400–500':(400,500)}[length]
     cover=st.selectbox('本次目標詞覆蓋需求',['自然度優先','每篇至少60%','每篇至少80%'])
     theme=st.text_input('新情境／主題（選填）', placeholder='例如：從機場接人改為在校園第一次見面')
+    guiding_raw=st.text_area(
+        '補充引導詞（選填，建議 2～3 個）',
+        height=76,
+        placeholder='例如：機場、朋友、第一次',
+        help='教師指定且允許使用的詞彙。供 LLM 發想新的事件與情境，不列入當課生詞複現率，也不列為超綱。',
+    )
+    guiding_words=uniq(re.split(r'[,，、\n；;\s]+',guiding_raw))
+    if guiding_words:
+        st.caption('本次核准引導詞：'+'、'.join(guiding_words)+'。可自然出現在新文本中，並列入詞彙檢測的允許集合。')
+        if len(guiding_words)>3:
+            st.info('建議 2～3 個引導詞；目前仍全部視為教師允許詞。')
     st.subheader('人物姓名（生成前先確認）')
     st.caption('可選截至本課所有已出現的名字（含前面各課），不限制當課人名；教師也可自行增加。')
     source_people=names_from_dialogue(lesson[reference])
@@ -598,7 +609,8 @@ with st.sidebar:
                                   key=f'extra_names_{idx}_{reference}')
     approved_names=uniq(selected_names+re.split(r'[,，、\n]+',manual_names_raw))
     allowed_raw=st.text_area('教師允許保留的額外詞（可選，每行一詞）',height=75)
-    allowed=uniq(re.split(r'[,，、\n]+',allowed_raw))
+    # 引導詞是教師核准的詞，和一般允許詞一同作為檢測白名單；但不算本課複現目標。
+    allowed=uniq(re.split(r'[,，、\n]+',allowed_raw)+guiding_words)
     st.divider()
     st.subheader('閱讀測驗預先設定')
     quiz_basis=st.selectbox('命題依據',['優先針對新舊文本變化','依閱讀理解目標','兩者混合'],index=0)
@@ -615,12 +627,13 @@ attested_phrases=original_sentences+grammar_sentences
 current_key=f'{idx}:{reference}:{form}:{n}'
 if st.session_state.get('active_key')!=current_key:
     st.session_state['active_key']=current_key
-    for k in ['draft','final_text','quiz_text','answer_text','approved','last_audit','audited_text','retained_words','glossary_editor','quiz_allowed_raw','audited_names']:
+    for k in ['draft','final_text','quiz_text','answer_text','approved','last_audit','audited_text','retained_words','glossary_editor','quiz_allowed_raw','audited_names','audited_guides']:
         st.session_state.pop(k,None)
 
 with st.expander('查看教材來源與複現目標',expanded=False):
     st.write('**原課文：**');st.text(source)
     st.write('**當課目標生詞：**','、'.join(target) or '（原文未載）')
+    st.write('**本次補充引導詞（教師允許）：**','、'.join(guiding_words) or '未設定')
     st.write('**當課目標語法：**','；'.join(gtarget) or '（原文未載）')
     st.caption(f'截至本課：全課文重建斷詞 {len(text_evidence)} 項（主要已學比對集合）；生詞表 {len(known)} 項（複現目標來源）；語法例句 {len(grammar_evidence)} 項；整課字數約 {whole_len} 字。')
     st.info('目前 JSON 未保留原始人工校訂的全課斷詞清單；此處從完整課文使用本專案 Jieba 字典重建。若您有原始斷詞 JSON，可再替換。')
@@ -633,6 +646,8 @@ with st.expander('生成提示詞',expanded=True):
 【任務】
 1. 新文本必須有明確不同於原課文的事件目的、重要資訊或結果；不能只更換人物姓名、地點或對話順序。
 2. 只可使用下列教師已確認的人名／說話者：{'、'.join(approved_names) or '無（請使用無人名的文章）'}。不得新增姓名或自創說話者；如果需要代稱，可用已學的『我、你、他、她』。{('指定新情境：'+theme) if theme else '請自行提出有變化的新情境。'}
+【教師核准的補充引導詞】{'、'.join(guiding_words) if guiding_words else '未提供（請依原課文主題自行發想）'}
+補充引導詞是教師允許使用的詞語，不屬於未學詞違規，也不計入「當課目標生詞」複現率。請優先利用其語意發想新的事件、目的、互動或結果，並在自然合理時寫入正文；不是單純把引導詞插進原對話。如果少數引導詞與情節不合，不必強制逐字使用，更不能因此照搬原文。
 3. 每篇正文繁體中文（臺灣用語），長度約 {target_len[0]} 至 {target_len[1]} 個中文字，不含標題與說話者標籤。
 4. {('每篇需有相對完整的小事件，且篇幅相近；'+relation) if n>1 else '單篇需有完整的小事件。'}
 5. 本課應複現的生詞：{'、'.join(target)}。
@@ -655,6 +670,7 @@ if st.button('執行 Python 檢測',type='primary'):
         st.session_state['last_audit']=report
         st.session_state['audited_text']=raw
         st.session_state['audited_names']=tuple(sorted(approved_names))
+        st.session_state['audited_guides']=tuple(sorted(guiding_words))
         st.session_state['approved']=False
 report=st.session_state.get('last_audit')
 if report:
@@ -699,15 +715,16 @@ if report:
 【教師意見】{notes or '優先處理疑似超綱並維持語句自然。'}
 【原教材來源，僅供避免照搬】\n{source}
 【本次待修訂文本】\n{st.session_state['draft']}
-【Python 檢測（疑似而非確定錯誤）】\n疑似超綱：{suspects}\n教師確認保留、供閱讀前補充的詞：{'、'.join(retained) or '無'}\n優先檢查是否需要改寫的疑似超綱詞：{to_repair}\n未出現目標生詞：{lack}\n與原文相似度：{report['整體字元相似度']:.0%}
-【要求】教師指定保留的詞不得因為超綱而刪除；其餘疑似超綱詞請逐項判斷是否需要修改（含人名及語境），必要時改為截至本課學過的詞；不能只把超綱詞拆成單字，不能犧牲語意正確或自然度。維持原先篇數、各篇完整事件、{target_len[0]}至{target_len[1]}字左右。若原課文重合過高，請改變事件目的、資訊或結果。只輸出修訂後的完整文本，禁止輸出詞彙來源、對話分析、解釋或修訂報告。'''
+【Python 檢測（疑似而非確定錯誤）】\n疑似超綱：{suspects}\n教師核准的情境引導詞（可使用，勿以超綱為由刪除）：{'、'.join(guiding_words) or '無'}\n教師確認保留、供閱讀前補充的詞：{'、'.join(retained) or '無'}\n優先檢查是否需要改寫的疑似超綱詞：{to_repair}\n未出現目標生詞：{lack}\n與原文相似度：{report['整體字元相似度']:.0%}
+【要求】補充引導詞是已核准的創作詞彙，請保留它們對新情節的引導作用，不需每個詞都強制出現；教師指定保留的詞不得因為超綱而刪除；其餘疑似超綱詞請逐項判斷是否需要修改（含人名及語境），必要時改為截至本課學過的詞；不能只把超綱詞拆成單字，不能犧牲語意正確或自然度。維持原先篇數、各篇完整事件、{target_len[0]}至{target_len[1]}字左右。若原課文重合過高，請改變事件目的、資訊或結果。只輸出修訂後的完整文本，禁止輸出詞彙來源、對話分析、解釋或修訂報告。'''
         format_prompt(prompt2)
     st.markdown('**教師確認定稿**')
     st.caption('檢測後如要人工修改，請重新檢測。確認前不能進行命題。')
     names_changed=st.session_state.get('audited_names') != tuple(sorted(approved_names))
-    if st.session_state.get('audited_text') != st.session_state.get('draft') or names_changed:
-        st.warning('文本或核准人名已在上次檢測後變更，請重新檢測。')
-    if st.button('將目前檢測內容確認為定稿', disabled=(st.session_state.get('audited_text') != st.session_state.get('draft') or names_changed or bool(report['未核准說話者']))):
+    guides_changed=st.session_state.get('audited_guides') != tuple(sorted(guiding_words))
+    if st.session_state.get('audited_text') != st.session_state.get('draft') or names_changed or guides_changed:
+        st.warning('文本、核准人名或補充引導詞在上次檢測後變更，請重新檢測。')
+    if st.button('將目前檢測內容確認為定稿', disabled=(st.session_state.get('audited_text') != st.session_state.get('draft') or names_changed or guides_changed or bool(report['未核准說話者']))):
         st.session_state['final_text']=st.session_state['draft']
         st.session_state['approved']=True
         st.session_state['quiz_text']=''
@@ -840,4 +857,4 @@ else:
     with b:
         st.download_button('下載教師版 Word（附答案）',data=teacher_doc,file_name='ReadingParallel_教師版.docx',mime='application/vnd.openxmlformats-officedocument.wordprocessingml.document',key='word_teacher_download')
 
-st.caption('v1.7：先以截至目標課的全課文重建斷詞集合核對已學詞；生詞表另作複現目標；人名累積前面各課。第四階段 Word 可獨立使用。無需 LLM API。')
+st.caption('v1.8：補充引導詞視為教師允許詞並引導新情節；先以截至目標課的全課文重建斷詞集合核對已學詞；生詞表另作複現目標；人名累積前面各課。第四階段 Word 可獨立使用。無需 LLM API。')
