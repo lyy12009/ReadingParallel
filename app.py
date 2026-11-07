@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""ReadingParallel Python v1.5: independent teacher-in-the-loop LLM prompt + audit app."""
+"""ReadingParallel Python v1.7: independent teacher-in-the-loop LLM prompt + audit app."""
 from __future__ import annotations
 import io
 import json
@@ -94,7 +94,40 @@ CJK_WORD = re.compile(r'[\u3400-\u9fffA-Za-z0-9]+')
 PUNCT = re.compile(r'[，。！？；：「」『』、,.!?;:\s]+')
 
 st.set_page_config(page_title='高複現閱讀文本工作室', page_icon='📖', layout='wide')
-st.title('高複現華語閱讀文本工作室 · Python v1.5')
+# 提高輸入框、選單、操作階段的辨識度；不改變原有 Streamlit 操作方式。
+st.markdown('''
+<style>
+/* 多行輸入框與一般輸入框：加深邊線以利教師辨識 */
+div[data-testid="stTextArea"] textarea,
+div[data-testid="stTextInput"] input {
+    border: 2px solid #64748b !important;
+    border-radius: 7px !important;
+    background-color: #ffffff !important;
+    color: #172033 !important;
+}
+div[data-testid="stTextArea"] textarea:focus,
+div[data-testid="stTextInput"] input:focus {
+    border: 2px solid #175cd3 !important;
+    box-shadow: 0 0 0 2px rgba(23,92,211,.15) !important;
+}
+/* 深色主題下維持可讀性，並標示輸入框 */
+@media (prefers-color-scheme: dark) {
+  div[data-testid="stTextArea"] textarea,
+  div[data-testid="stTextInput"] input { background-color: #202b3d !important; color: #f8fafc !important; }
+}
+/* 四階段標題與原本的細分隔線建立清楚的工作流程 */
+div[data-testid="stMainBlockContainer"] h3 {
+    border-left: 5px solid #2563eb;
+    background: rgba(76,129,205,.09);
+    padding: 9px 12px;
+    margin-top: 14px;
+    border-radius: 3px;
+}
+div[data-testid="stSidebar"] { border-right: 2px solid #94a3b8; }
+div[data-testid="stDownloadButton"] button { border: 2px solid #2563eb; font-weight: 650; }
+</style>
+''', unsafe_allow_html=True)
+st.title('高複現華語閱讀文本工作室 · Python v1.7')
 st.caption('教師選課 → 生成新文本 → Python 檢測 → 選擇性修訂 → 依定稿文本命題 → 檢核 → Word。LLM 請在外部使用，無需 API Key。')
 if BIG_DICT_LOADED:
     st.success(f'繁體中文大字典已載入：{BIG_DICT.relative_to(HERE)}（{BIG_DICT.stat().st_size/1024/1024:.1f} MB）')
@@ -320,39 +353,150 @@ def glossary_lines(text):
 
 
 def write_docx(text, quiz, answer, title, glossary_text='', teacher_version=False):
-    doc=Document()
-    sec=doc.sections[0]
-    sec.page_width=Cm(21)
-    sec.page_height=Cm(29.7)
-    sec.top_margin=sec.bottom_margin=Cm(2.2)
-    sec.left_margin=sec.right_margin=Cm(2.3)
-    styles=doc.styles
-    normal=styles['Normal']
-    normal.font.name='Microsoft JhengHei'
-    normal.font.size=Pt(13)
-    normal.paragraph_format.line_spacing=1.5
-    normal.paragraph_format.space_after=Pt(4)
-    doc.add_heading(title,0)
+    """A4 教材版：區塊留白、題目不拆頁、善用兩欄選項與穩定的中文行距。"""
+    from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK
+    from docx.enum.table import WD_TABLE_ALIGNMENT, WD_CELL_VERTICAL_ALIGNMENT
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    doc = Document()
+    sec = doc.sections[0]
+    sec.page_width, sec.page_height = Cm(21), Cm(29.7)
+    sec.top_margin, sec.bottom_margin = Cm(1.55), Cm(1.55)
+    sec.left_margin, sec.right_margin = Cm(1.7), Cm(1.7)
+    sec.header_distance, sec.footer_distance = Cm(.7), Cm(.7)
+    body_width = 21 - 2 * 1.7
+
+    normal = doc.styles['Normal']
+    normal.font.name = 'Microsoft JhengHei'
+    normal.font.size = Pt(11)
+    normal.paragraph_format.line_spacing = 1.22
+    normal.paragraph_format.space_before = Pt(0)
+    normal.paragraph_format.space_after = Pt(0)
+
+    def style_run(run, size=11, bold=False):
+        run.font.name = 'Microsoft JhengHei'
+        run.font.size = Pt(size)
+        run.bold = bold
+        run._element.rPr.rFonts.set(qn('w:eastAsia'), 'Microsoft JhengHei')
+        return run
+
+    def line(value, *, after=0, before=0, keep_next=False, bold=False):
+        p = doc.add_paragraph(style='Normal')
+        f=p.paragraph_format
+        f.space_before, f.space_after = Pt(before), Pt(after)
+        f.keep_together=True
+        f.keep_with_next=keep_next
+        style_run(p.add_run(value),bold=bold)
+        return p
+
+    def heading(value):
+        p = line(value, before=11, after=5, keep_next=True, bold=True)
+        for r in p.runs: r.font.size=Pt(11.5)
+        return p
+
+    def no_table_borders(table):
+        tblPr=table._tbl.tblPr
+        borders=OxmlElement('w:tblBorders')
+        for side in ('top','left','bottom','right','insideH','insideV'):
+            x=OxmlElement('w:'+side)
+            x.set(qn('w:val'),'nil')
+            borders.append(x)
+        tblPr.append(borders)
+
+    def choice_row(options, *, keep_next=False):
+        # Word table two equal-width columns, visually uses page width.
+        tb=doc.add_table(rows=1, cols=2)
+        tb.autofit=False
+        tb.alignment=WD_TABLE_ALIGNMENT.CENTER
+        no_table_borders(tb)
+        for j, option in enumerate(options):
+            cell=tb.cell(0,j)
+            cell.width=Cm(body_width/2)
+            cell.vertical_alignment=WD_CELL_VERTICAL_ALIGNMENT.CENTER
+            cp=cell.paragraphs[0]
+            cp.paragraph_format.space_before=Pt(0)
+            cp.paragraph_format.space_after=Pt(0)
+            cp.paragraph_format.line_spacing=1.2
+            cp.paragraph_format.keep_together=True
+            cp.paragraph_format.keep_with_next=keep_next
+            style_run(cp.add_run(option))
+        return tb
+
+    head=doc.add_paragraph(style='Normal')
+    head.alignment=WD_ALIGN_PARAGRAPH.CENTER
+    head.paragraph_format.space_after=Pt(9)
+    style_run(head.add_run(title.strip() or '閱讀測驗'),size=15,bold=True)
+
     items=glossary_lines(glossary_text)
     if items:
-        doc.add_heading('閱讀前補充生詞',level=1)
-        for word,meaning in items:
-            doc.add_paragraph(f'{word}：{meaning}' if meaning else word)
-    doc.add_heading('閱讀文本',level=1)
-    for line in text.strip().splitlines():
-        doc.add_paragraph(line)
+        heading('閱讀前補充生詞')
+        # 短生詞兩欄，較長解釋自然換行；不以全形空格硬撐欄距。
+        for i in range(0,len(items),2):
+            vals=[f'{w}：{m}' if m else w for w,m in items[i:i+2]]
+            vals += ['']*(2-len(vals))
+            choice_row(vals)
+
+    heading('閱讀文本')
+    content=[x.strip() for x in text.strip().splitlines() if x.strip()]
+    for j, value in enumerate(content):
+        line(value, after=1.2)
+
+    question_re=re.compile(r'^(?:\d{1,2}[.．、)]|[（(]\d{1,2}[)）]|第[一二三四五六七八九十\d]+題)\s*')
+    option_re=re.compile(r'^([A-D])[.．、)）\s]+',re.I)
     if quiz.strip():
-        doc.add_heading('閱讀測驗',level=1)
-        for line in quiz.strip().splitlines():
-            doc.add_paragraph(line)
+        heading('閱讀測驗')
+        qlines=[x.strip() for x in quiz.strip().splitlines() if x.strip()]
+        # Parse question blocks; an explicit question number starts new block.
+        blocks=[]
+        current=[]
+        for val in qlines:
+            if question_re.match(val) and current:
+                blocks.append(current)
+                current=[]
+            current.append(val)
+        if current: blocks.append(current)
+        for block_index,block in enumerate(blocks):
+            if not block:continue
+            q=block[0]
+            if not question_re.match(q):
+                # Instructions such as「請選出正確答案」 remain outside question blocks.
+                line(q,after=4,keep_next=True)
+                rest=block[1:]
+                question_started=False
+            else:
+                # Question begins new visual block; the question and its answer choices stay together.
+                line(q,before=(4 if block_index==0 else 10),after=3,keep_next=True)
+                rest=block[1:]
+                question_started=True
+            opts=[]
+            for item in rest:
+                if option_re.match(item):
+                    opts.append(item)
+                else:
+                    if opts:
+                        for k in range(0,len(opts),2):
+                            choice_row((opts[k:k+2]+[''])[:2],keep_next=(k+2<len(opts)))
+                        opts=[]
+                    line(item,after=2,keep_next=question_started)
+            if opts:
+                # Only pair short options. Long or full sentence options use all available width.
+                if len(opts)==4 and all(len(x)<=24 for x in opts):
+                    choice_row(opts[:2],keep_next=True)
+                    choice_row(opts[2:],keep_next=False)
+                else:
+                    for j,opt in enumerate(opts):
+                        line(opt,after=1,keep_next=j<len(opts)-1)
+
     if teacher_version and answer.strip():
         doc.add_page_break()
-        doc.add_heading('教師答案',level=1)
-        for line in answer.strip().splitlines():
-            doc.add_paragraph(line)
-    buf=io.BytesIO()
-    doc.save(buf)
-    return buf.getvalue()
+        heading('教師答案')
+        for value in answer.strip().splitlines():
+            if value.strip():line(value.strip(),after=3)
+
+    out=io.BytesIO()
+    doc.save(out)
+    return out.getvalue()
 
 
 def split_items(text):
@@ -696,4 +840,4 @@ else:
     with b:
         st.download_button('下載教師版 Word（附答案）',data=teacher_doc,file_name='ReadingParallel_教師版.docx',mime='application/vnd.openxmlformats-officedocument.wordprocessingml.document',key='word_teacher_download')
 
-st.caption('v1.5：先以截至目標課的全課文重建斷詞集合核對已學詞；生詞表另作複現目標；人名累積前面各課。第四階段 Word 可獨立使用。無需 LLM API。')
+st.caption('v1.7：先以截至目標課的全課文重建斷詞集合核對已學詞；生詞表另作複現目標；人名累積前面各課。第四階段 Word 可獨立使用。無需 LLM API。')
