@@ -1,4 +1,4 @@
-# ReadingParallel Python v1.2 — Streamlit Cloud
+# 高複現華語閱讀文本工作室 · Python v1.9
 
 ## 修正 2026-11-07 的 Jieba ValueError
 
