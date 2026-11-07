@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""ReadingParallel Python v1.2: independent teacher-in-the-loop LLM prompt + audit app."""
+"""ReadingParallel Python v1.3: independent teacher-in-the-loop LLM prompt + audit app."""
 from __future__ import annotations
 import io
 import json
@@ -94,7 +94,7 @@ CJK_WORD = re.compile(r'[\u3400-\u9fffA-Za-z0-9]+')
 PUNCT = re.compile(r'[，。！？；：「」『』、,.!?;:\s]+')
 
 st.set_page_config(page_title='高複現閱讀文本工作室', page_icon='📖', layout='wide')
-st.title('高複現華語閱讀文本工作室 · Python v1.2')
+st.title('高複現華語閱讀文本工作室 · Python v1.3')
 st.caption('教師選課 → 生成新文本 → Python 檢測 → 選擇性修訂 → 依定稿文本命題 → 檢核 → Word。LLM 請在外部使用，無需 API Key。')
 if BIG_DICT_LOADED:
     st.success(f'繁體中文大字典已載入：{BIG_DICT.relative_to(HERE)}（{BIG_DICT.stat().st_size/1024/1024:.1f} MB）')
@@ -203,33 +203,143 @@ def format_prompt(text):
     st.caption('按程式碼框右上角複製，再貼至 ChatGPT、Gemini 或其他 LLM。')
 
 
-def write_docx(text,quiz,answer,title):
-    doc=Document(); sec=doc.sections[0]; sec.top_margin=sec.bottom_margin=Cm(2.2)
-    normal=doc.styles['Normal'];normal.font.name='Microsoft JhengHei';normal.font.size=Pt(13)
+def compare_changes(original, revised, limit=12):
+    """Textual change candidates only; the model/teacher must assess semantic relevance."""
+    def chunks(t):
+        return [v.strip() for v in re.split(r'(?<=[。！？!?；;\n])|(?<=，)', t) if v.strip()]
+    before, after = chunks(original), chunks(revised)
+    sm = SequenceMatcher(None, before, after, autojunk=False)
+    changes=[]
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag=='equal':
+            continue
+        prev=''.join(before[i1:i2]).strip()[:145]
+        next_=''.join(after[j1:j2]).strip()[:145]
+        if not next_:
+            continue
+        # Do not equate a text diff with a factual/semantic difference.
+        changes.append({'原文片段':prev or '（原文無對應片段）', '新文本片段':next_, '類型':tag})
+    if not changes and original.strip()!=revised.strip():
+        changes=[{'原文片段':original[:145], '新文本片段':revised[:145], '類型':'文字變動'}]
+    return changes[:limit]
+
+
+def glossary_lines(text):
+    """Teacher input: 詞語：說明, one item per line; no invented definitions."""
+    rows=[]
+    for line in text.splitlines():
+        line=line.strip()
+        if not line: continue
+        parts=re.split('[：:｜|]',line,maxsplit=1)
+        word=parts[0].strip()
+        meaning=parts[1].strip() if len(parts)>1 else ''
+        if word:
+            rows.append((word,meaning))
+    return rows
+
+
+def write_docx(text, quiz, answer, title, glossary_text='', teacher_version=False):
+    doc=Document()
+    sec=doc.sections[0]
+    sec.top_margin=sec.bottom_margin=Cm(2.2)
+    sec.left_margin=sec.right_margin=Cm(2.3)
+    styles=doc.styles
+    normal=styles['Normal']
+    normal.font.name='Microsoft JhengHei'
+    normal.font.size=Pt(13)
     normal.paragraph_format.line_spacing=1.5
+    normal.paragraph_format.space_after=Pt(4)
     doc.add_heading(title,0)
+    items=glossary_lines(glossary_text)
+    if items:
+        doc.add_heading('閱讀前補充生詞',level=1)
+        for word,meaning in items:
+            doc.add_paragraph(f'{word}：{meaning}' if meaning else word)
     doc.add_heading('閱讀文本',level=1)
-    for t in text.strip().split('\n'):
-        doc.add_paragraph(t)
+    for line in text.strip().splitlines():
+        doc.add_paragraph(line)
     if quiz.strip():
         doc.add_heading('閱讀測驗',level=1)
-        for t in quiz.strip().split('\n'):
-            doc.add_paragraph(t)
-    if answer.strip():
-        doc.add_page_break();doc.add_heading('教師答案',level=1)
-        for t in answer.strip().split('\n'):
-            doc.add_paragraph(t)
-    buf=io.BytesIO();doc.save(buf);return buf.getvalue()
+        for line in quiz.strip().splitlines():
+            doc.add_paragraph(line)
+    if teacher_version and answer.strip():
+        doc.add_page_break()
+        doc.add_heading('教師答案',level=1)
+        for line in answer.strip().splitlines():
+            doc.add_paragraph(line)
+    buf=io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
 
 
 def split_items(text):
-    # Accept common LLM numbered questions: 1. / 1、 / 第一題 / （1）
-    lines=text.splitlines()
+    """Count actual question headers, ignoring choices and sample placeholders."""
     matches=[]
-    for line in lines:
-        if re.match(r'^\s*(?:\d{1,2}[.．、)]|[（(]\d{1,2}[)）]|第[一二三四五六七八九十\d]+題)',line):
-            matches.append(line.strip())
+    for line in text.splitlines():
+        val=line.strip()
+        if re.match(r'^(?:\d{1,2}[.．、)]|[（(]\d{1,2}[)）]|第[一二三四五六七八九十\d]+題)\s*',val):
+            if len(re.sub(r'^(?:\d{1,2}[.．、)]|[（(]\d{1,2}[)）]|第[一二三四五六七八九十\d]+題)\s*','',val).strip())>=3 and not re.search(r'\[.*?題.*?\]|\[第一題',val):
+                matches.append(val)
     return matches
+
+
+def inspect_questions(raw, qtype, qty):
+    main=re.split(r'教師答案\s*[:：]?\s*',raw,maxsplit=1)[0]
+    found=split_items(main)
+    issues=[]
+    if len(found)!=qty:
+        issues.append(f'題數應為 {qty}，目前辨識 {len(found)} 題。')
+    if re.search(r'【?對話[一二三123]】?|詞彙來源|第[一二三123]冊第',main):
+        issues.append('出現疑似對話續寫或詞彙來源說明。')
+    if re.search(r'\[(?:第一題|選項|答案|題幹)|依此編寫|填寫題目|請直接給',main):
+        issues.append('內容可能保留提示詞範例，而非正式測驗題。')
+    if qtype=='單選題':
+        for letter in 'ABCD':
+            count=len(re.findall(r'(?m)^\s*'+letter+r'[.．、)）]\s*\S+',main))
+            if count<qty:
+                issues.append(f'單選題選項 {letter} 只有 {count}/{qty} 項。')
+    return found, issues
+
+
+def extract_quiz_language(quiz):
+    # Separate questions and options; omit headings, question numbers and A-D labels.
+    heads, choices=[], []
+    for raw in quiz.splitlines():
+        line=raw.strip()
+        if not line or re.fullmatch(r'(閱讀測驗|閱讀理解|問題|選擇題|是非題|簡答題|事件排序|教師答案|答案)[:：]?',line):
+            continue
+        if re.match(r'^(?:A|B|C|D|Ａ|Ｂ|Ｃ|Ｄ)[.．、)）\s]',line,re.I):
+            choices.append(re.sub(r'^(?:A|B|C|D|Ａ|Ｂ|Ｃ|Ｄ)[.．、)）\s]*','',line,flags=re.I))
+        else:
+            line=re.sub(r'^(?:\d{1,2}[.．、)）]|[（(]\d{1,2}[)）]|第[一二三四五六七八九十\d]+題)\s*','',line)
+            heads.append(line)
+    return '\n'.join(heads), '\n'.join(choices)
+
+
+def audit_quiz_language(quiz, known, allow):
+    question_stems, choices=extract_quiz_language(quiz)
+    r1=audit(question_stems,known,[], '',allow)
+    r2=audit(choices,known,[], '',allow)
+    return {'題幹與說明':r1,'選項':r2}
+
+
+def quiz_revision_prompt(quiz,issues,stems_bad,choices_bad,final,quiz_type,quiz_qty,retain):
+    return f'''你是臺灣對外華語閱讀測驗的審題教師。只修改下列題幹、作答說明與選項，不得生成新故事，也不得修改閱讀文本。
+【已定稿的閱讀文本，僅用於核對答案】
+{final}
+【原測驗題目】
+{quiz}
+【程式檢查結果（斷詞誤判可能存在，先依語意確認）】
+形式問題：{'；'.join(issues) or '無'}
+題幹／說明疑似超綱：{'、'.join(stems_bad) or '無'}
+選項疑似超綱：{'、'.join(choices_bad) or '無'}
+教師明確允許保留的測驗用詞：{'、'.join(retain) or '無'}
+【修改規則】
+1. 僅在必要時改寫含疑似超綱詞的題幹、作答說明與選項；請盡量改用較初級、已學過的詞語。已允許的用詞可以保留。
+2. 不改變原本要考的閱讀資訊，不增加定稿文本沒有的事實；不能把閱讀本文中的重要差異刪到失去測驗目的。
+3. 以「{quiz_type}」輸出 {quiz_qty} 題，題號由 1. 起。若是單選題每題必有 A、B、C、D 四個完整選項且僅一個正確。
+4. 輸出「閱讀測驗」及完整題目，再輸出「教師答案」及每題答案。不要提供解析、詞彙來源、出處或對話二。
+只輸出可直接給教師使用的正式題目與答案。'''
 
 
 with st.sidebar:
@@ -251,13 +361,21 @@ with st.sidebar:
     theme=st.text_input('新情境／主題（選填）', placeholder='例如：從機場接人改為在校園第一次見面')
     allowed_raw=st.text_area('教師允許保留的額外詞（可選，每行一詞）',height=75)
     allowed=uniq(re.split(r'[,，、\n]+',allowed_raw))
+    st.divider()
+    st.subheader('閱讀測驗預先設定')
+    quiz_basis=st.selectbox('命題依據',['優先針對新舊文本變化','依閱讀理解目標','兩者混合'],index=0)
+    quiz_type=st.selectbox('題型',['單選題','是非題','簡答題','事件排序','混合題型'])
+    quiz_qty=st.selectbox('題數',[3,4,5,6],index=0)
+    quiz_focus=st.selectbox('閱讀理解重點',['訊息擷取與理解','推論與整合','混合'])
+    quiz_extra=st.text_area('教師指定命題方向（選填）',placeholder='例如：人物改變決定的原因、結局的差異',height=65)
+
 
 source=lesson[reference]; target=words(lesson,[reference]); gtarget=grammar(lesson,[reference])
 known=get_lexicon(idx)
 current_key=f'{idx}:{reference}:{form}:{n}'
 if st.session_state.get('active_key')!=current_key:
     st.session_state['active_key']=current_key
-    for k in ['draft','final_text','quiz_text','answer_text','approved','last_audit']:
+    for k in ['draft','final_text','quiz_text','answer_text','approved','last_audit','audited_text','retained_words','glossary_editor','quiz_allowed_raw']:
         st.session_state.pop(k,None)
 
 with st.expander('查看教材來源與複現目標',expanded=False):
@@ -314,16 +432,29 @@ if report:
     with right:
         st.markdown('**疑似超綱詞（需教師核對）**')
         st.dataframe([{'詞':w,'次數':v} for w,v in report['疑似超綱'].most_common()],hide_index=True,use_container_width=True)
+    st.markdown('**保留少量超綱詞，作為閱讀前補充生詞**')
+    st.caption('大量閱讀可以接觸少量尚未教過、但有助於理解的詞。勾選保留不代表已學；教師可在下方為學生提供簡短解釋。')
+    suspect_options=list(report['疑似超綱'].keys())
+    if 'retained_words' not in st.session_state:
+        st.session_state['retained_words']=[]
+    st.session_state['retained_words']=[w for w in st.session_state['retained_words'] if w in suspect_options]
+    retained=st.multiselect('教師決定保留的疑似超綱詞（不要求 LLM 刪除）',suspect_options,key='retained_words')
+    if retained:
+        st.caption('下列詞語解釋可稍後放在學生閱讀文本前；請由教師填寫，系統不會自動捏造詞義。')
+    # Display selected vocabulary as explicit candidates; explanations remain teacher-written.
+    with st.expander('補充生詞說明（可於第四階段編輯）',expanded=bool(retained)):
+        st.code('\n'.join(f'{w}：' for w in retained) if retained else '目前尚未選擇保留詞',language='text')
     with st.expander('生成修訂提示詞（選用）'):
         notes=st.text_area('教師修訂意見',placeholder='例如：保留人物，但改變事件；增加當課未使用詞；調整自然度。')
         suspects='、'.join(f'{w}({c})' for w,c in report['疑似超綱'].most_common(45)) or '未檢出'
         lack='、'.join(w for w,c in report['目標詞複現'].items() if not c) or '無'
+        to_repair='、'.join(f'{w}({c})' for w,c in report['疑似超綱'].most_common(45) if w not in retained) or '無'
         prompt2=f'''請只修訂下列已生成的華語閱讀文本，不要寫新篇章，不要續寫原課文。
 【教師意見】{notes or '優先處理疑似超綱並維持語句自然。'}
 【原教材來源，僅供避免照搬】\n{source}
 【本次待修訂文本】\n{st.session_state['draft']}
-【Python 檢測（疑似而非確定錯誤）】\n疑似超綱：{suspects}\n未出現目標生詞：{lack}\n與原文相似度：{report['整體字元相似度']:.0%}
-【要求】逐項判斷是否真的超綱（含人名及語境），必要時改為截至本課學過的詞；不能只把超綱詞拆成單字，不能犧牲語意正確或自然度。維持原先篇數、各篇完整事件、{target_len[0]}至{target_len[1]}字左右。若原課文重合過高，請改變事件目的、資訊或結果。只輸出修訂後的完整文本，禁止輸出詞彙來源、對話分析、解釋或修訂報告。'''
+【Python 檢測（疑似而非確定錯誤）】\n疑似超綱：{suspects}\n教師確認保留、供閱讀前補充的詞：{'、'.join(retained) or '無'}\n優先檢查是否需要改寫的疑似超綱詞：{to_repair}\n未出現目標生詞：{lack}\n與原文相似度：{report['整體字元相似度']:.0%}
+【要求】教師指定保留的詞不得因為超綱而刪除；其餘疑似超綱詞請逐項判斷是否需要修改（含人名及語境），必要時改為截至本課學過的詞；不能只把超綱詞拆成單字，不能犧牲語意正確或自然度。維持原先篇數、各篇完整事件、{target_len[0]}至{target_len[1]}字左右。若原課文重合過高，請改變事件目的、資訊或結果。只輸出修訂後的完整文本，禁止輸出詞彙來源、對話分析、解釋或修訂報告。'''
         format_prompt(prompt2)
     st.markdown('**教師確認定稿**')
     st.caption('檢測後如要人工修改，請重新檢測。確認前不能進行命題。')
@@ -334,54 +465,110 @@ if report:
         st.session_state['approved']=True
         st.session_state['quiz_text']=''
         st.session_state['answer_text']=''
+        st.session_state.pop('answer_editor', None)
+        st.session_state.pop('quiz_answer_source', None)
+        st.session_state['approved_retained']=list(st.session_state.get('retained_words',[]))
         st.success('已鎖定此份文本作為命題依據。')
 
 st.divider()
-st.subheader('第三階段｜只依定稿文本命題')
+st.subheader('第三階段｜依定稿文本命題')
 if not st.session_state.get('approved'):
     st.info('請先在第二階段完成檢測，並按「確認為定稿」。')
 else:
     final=st.session_state['final_text']
-    a,b,c=st.columns(3)
-    with a: qtype=st.selectbox('題型',['單選題','是非題','簡答題','事件排序','混合題型'])
-    with b: qty=st.selectbox('題數',[3,4,5,6],index=0)
-    with c: qscope=st.selectbox('命題重點',['訊息擷取與理解','推論與整合','混合'])
-    prompt3=f'''你是臺灣華語閱讀測驗命題教師。**本次任務只寫題目，不要創作、改寫或續寫閱讀文本。**
-【唯一命題依據：教師已審定閱讀文本】\n{final}
-【命題指令】
-- 題型：{qtype}。共 {qty} 題。重點：{qscope}。
-- 每題須能根據上述閱讀文本回答。不得詢問教材出版社、詞彙出自第幾冊第幾課或語法術語。
-- 題幹及選項應盡量使用文本既有詞彙與初級學習者已學用語，不加不必要的背景知識。
-- 單選題每題必須有 A、B、C、D 四個選項，且只有一個正確答案。
-- 是非題每題是可以判定對錯的陳述句；簡答題須有可驗證的答案；事件排序題須有明確事件序列。
-【禁止】禁止輸出任何新對話、新閱讀文本、詞語定義、詞彙來源清單、課別分析、教師備註、命題原理，禁止出現「對話二」或「文本二」作為新創作。
-【輸出格式，必須嚴格遵守】
-閱讀測驗
-1. [第一題完整題幹]
-{('A. [選項]；B. [選項]；C. [選項]；D. [選項]' if qtype in ['單選題','混合題型'] else '[按指定題型提供學生作答內容]')}
-2. [第二題完整題幹]
-依此編寫至第 {qty} 題。
-教師答案
-1. [答案]
-依序列出第 {qty} 題答案。
-請直接給真正可作答的題目，不能只填空白模板、不能解釋規則。'''
-    format_prompt(prompt3)
-    quiz_raw=st.text_area('貼回 LLM 命題結果（可以包含「教師答案」段落）',height=220,key='quiz_text')
-    if st.button('檢查是否真的產生題目'):
-        main=re.split(r'教師答案\s*[:：]?\s*',quiz_raw,maxsplit=1)[0]
-        found=split_items(main)
-        if len(found)<qty:
-            st.error(f'偵測到 {len(found)} 道題目，少於設定的 {qty} 題。請要求 LLM 重新依格式命題，或人工修改。')
+    changes=compare_changes(source,final)
+    st.markdown('**本次命題設定（可回到左側選單修改）**')
+    st.write(f'命題依據：{quiz_basis}｜題型：{quiz_type}｜題數：{quiz_qty}｜閱讀理解：{quiz_focus}')
+    st.caption('下列只是程式比對的文字差異，不代表語意、事件一定已發生變化；應由教師與 LLM 依全文確認。')
+    with st.expander('檢視原課文與新文本的文字變化線索',expanded=True):
+        if changes:
+            st.dataframe([{'原課文片段':c['原文片段'],'新文本片段':c['新文本片段']} for c in changes],hide_index=True,use_container_width=True)
         else:
-            st.success(f'偵測到至少 {len(found)} 個題號，請再核對選項及答案內容。')
-        if re.search(r'(?:【?對話[一二三123]】?|詞彙來源|第[一二三123]冊第)',main):
-            st.warning('命題內容可能混入對話續寫或教材詞彙來源，建議刪除並重新命題。')
-        if qtype=='單選題' and sum(bool(re.search(r'\b[A-D][.．、]',line)) for line in main.splitlines())<qty:
-            st.warning('部分單選題可能缺少四個選項，請人工核對。')
-    answer=st.text_area('教師答案（可自行貼入或編輯；匯出時另起一頁）',height=100,key='answer_text')
-    doc_title=st.text_input('Word 文件標題',value=f"{book}{lesson['課']} 閱讀測驗")
+            st.info('沒有辨識出明顯的文字差異；請確認不是照搬原課文。')
+    difference_text='\n'.join(f"- 原：{v['原文片段']}\n  新：{v['新文本片段']}" for v in changes) or '（未辨識到明顯變化）'
+    if quiz_basis=='依閱讀理解目標':
+        difference_rule='不必刻意比較原課文，依定稿閱讀文本及指定的理解目標命題。'
+        difference_section=''
+    else:
+        difference_rule=('優先從新文本中與原課文不同的重要資訊、人物決定、事件發展或結果命題；只考新文本中的內容，不要求學生讀過原課文。' if quiz_basis=='優先針對新舊文本變化' else '兼顧新文本的關鍵變化與一般閱讀理解，兩類題目皆須涵蓋。')
+        difference_section='【Python 提供的文字差異線索（僅供參考，不保證是重要情節）】\n'+difference_text
+    prompt3=f'''你是臺灣華語閱讀測驗命題教師。此任務**只命題，不生成、改寫或續寫任何閱讀文本**。
+【唯一可供學生作答的閱讀文本（教師定稿）】
+{final}
+{difference_section}
+【命題設定】
+題型：{quiz_type}；題數：{quiz_qty}；理解目標：{quiz_focus}。
+教師指定命題方向：{quiz_extra or '無'}。
+命題原則：{difference_rule}
+1. 每題必須有明確答案，且答案能由「定稿文本」支持；不得單憑原課文出題。
+2. 原文與新文本的比較只供命題者挑選新文本的重要訊息，**學生不需要知道原課文**，題幹不可問「和原文相比」。
+3. 避免無關詞語釋義、出處、課別、語法術語；使用學生能理解的繁體中文與臺灣用語。
+4. 單選題每題四選項（A/B/C/D），只有一項正確；是非題要能判斷對錯；簡答與排序題須有可驗證答案。
+5. 不得提供只有題號的空白模板，也不得輸出新對話、「對話二」、新篇章、詞彙出處、命題原理或教師備註。
+【輸出要求】
+第一段標題固定「閱讀測驗」，逐題以「1.」「2.」連續編號至第 {quiz_qty} 題，**完整寫出每題題幹與必要選項**。
+第二段標題固定「教師答案」，按題號列出簡短標準答案；簡答題可附接受答案的條件。
+請直接輸出正式測驗與答案，不要重印閱讀文本。'''
+    format_prompt(prompt3)
+    quiz_raw=st.text_area('貼回 LLM 命題結果（可直接修改）',height=250,key='quiz_text')
     quiz_student, *quiz_answer = re.split(r'教師答案\s*[:：]?\s*',quiz_raw,maxsplit=1)
-    output_answer = answer.strip() or (quiz_answer[0].strip() if quiz_answer else '')
-    st.download_button('下載 Word 閱讀測驗（.docx）',data=write_docx(final,quiz_student,output_answer,doc_title),file_name='ReadingParallel_閱讀測驗.docx',mime='application/vnd.openxmlformats-officedocument.wordprocessingml.document')
+    if st.session_state.get('quiz_answer_source')!=quiz_raw:
+        st.session_state['answer_editor']=quiz_answer[0].strip() if quiz_answer else st.session_state.get('answer_editor','')
+        st.session_state['quiz_answer_source']=quiz_raw
+    output_answer=st.text_area('教師答案（可貼入或修改；學生版不會印出）',height=110,key='answer_editor')
+    found,issues=inspect_questions(quiz_student,quiz_type,quiz_qty)
+    st.markdown('**測驗題幹、作答說明與選項的超綱檢測**')
+    st.caption('閱讀正文可以保留經教師同意的超綱詞；測驗文字須另行檢測。題幹與選項分開統計，並非以閱讀正文是否通過代替。')
+    quiz_allowed_raw=st.text_area('測驗專用允許詞（每行一詞；選填）',height=65,key='quiz_allowed_raw',placeholder='例如：已在閱讀前補充且學生能理解的必要詞')
+    quiz_allowed=uniq(re.split(r'[,，、\n]+',quiz_allowed_raw))
+    quiz_language=audit_quiz_language(quiz_student,known,allowed+quiz_allowed)
+    stems_bad=quiz_language['題幹與說明']['疑似超綱']
+    choices_bad=quiz_language['選項']['疑似超綱']
+    if quiz_student.strip():
+        c_stem,c_choice=st.columns(2)
+        with c_stem:
+            st.metric('題幹／說明疑似超綱詞次',sum(stems_bad.values()))
+            if stems_bad:
+                st.dataframe([{'疑似超綱詞':w,'次數':c} for w,c in stems_bad.most_common()],hide_index=True,use_container_width=True)
+            else:
+                st.success('目前未標記題幹或說明的疑似超綱詞。')
+        with c_choice:
+            st.metric('選項疑似超綱詞次',sum(choices_bad.values()))
+            if choices_bad:
+                st.dataframe([{'疑似超綱詞':w,'次數':c} for w,c in choices_bad.most_common()],hide_index=True,use_container_width=True)
+            else:
+                st.success('目前未標記選項的疑似超綱詞。')
+        st.caption('此為教材詞庫與 Jieba 的比對警示，可能包含常用功能詞、人名及斷詞誤判；教師可修改題目或於上方允許詞欄確認保留。')
+        with st.expander('複製：測驗題目專用修訂 Prompt'):
+            format_prompt(quiz_revision_prompt(quiz_student,issues,list(stems_bad),list(choices_bad),final,quiz_type,quiz_qty,quiz_allowed))
+    if st.button('檢查題目完整性與語言難度'):
+        if stems_bad or choices_bad:
+            st.warning('題幹或選項有疑似超綱詞，請核對上方檢測結果。')
+        if not issues:
+            st.success(f'已辨識 {len(found)} 題，通過基本形式檢查。仍須由教師核對答案、干擾選項與語言難度。')
+        else:
+            for issue in issues: st.warning(issue)
+    st.divider()
+    st.subheader('第四階段｜補充生詞、編排與匯出 Word')
+    st.caption('閱讀前補充生詞是可選的。只收入教師確認需要解釋的詞，不自動列出所有疑似超綱詞。')
+    approved_retained=st.session_state.get('approved_retained',[])
+    if 'glossary_editor' not in st.session_state:
+        st.session_state['glossary_editor']='\n'.join(f'{w}：' for w in approved_retained)
+    glossary=st.text_area('學生版補充生詞（每行「詞語：簡短解釋」；可刪除不需要的詞）',key='glossary_editor',height=115)
+    show_glossary=st.checkbox('將補充生詞印在閱讀文本之前',value=bool(approved_retained))
+    doc_title=st.text_input('文件標題',value=f"{book}{lesson['課']} 閱讀測驗")
+    st.caption('學生版：標題、補充生詞（選用）、閱讀文本、測驗題。教師版在最後另附答案頁。頁面邊界與字級已設定，可於 Word 調整 A4 紙張與列印。')
+    if not quiz_student.strip():
+        st.info('尚未貼入測驗題。目前可先下載「只有閱讀文本」的版本；完成測驗後再輸出完整講義。')
+    if issues and quiz_student.strip():
+        st.warning('題目形式檢測仍有提醒，建議先修正再印發。')
+    export_glossary=glossary if show_glossary else ''
+    student_doc=write_docx(final,quiz_student,'',doc_title,export_glossary,False)
+    teacher_doc=write_docx(final,quiz_student,output_answer,doc_title,export_glossary,True)
+    a,b=st.columns(2)
+    with a:
+        st.download_button('下載學生版 Word（無答案）',data=student_doc,file_name='ReadingParallel_學生版.docx',mime='application/vnd.openxmlformats-officedocument.wordprocessingml.document')
+    with b:
+        st.download_button('下載教師版 Word（附答案）',data=teacher_doc,file_name='ReadingParallel_教師版.docx',mime='application/vnd.openxmlformats-officedocument.wordprocessingml.document')
 
 st.caption('版本說明：疑似超綱檢測為繁體大字典（可用時）＋ Jieba 斷詞＋教材詞庫優先匹配＋截至本課生詞表比對，不等於完整已學詞庫。人名、功能詞、句法、自然度及複現適切性需要教師審查；目前不自動呼叫付費 API。')
