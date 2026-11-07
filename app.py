@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""ReadingParallel Python v1.9: concise prompts and final quiz language audit."""
+"""ReadingParallel Python v2.0: single JSON handoff from LLM to editable Word output."""
 from __future__ import annotations
 import io
 import json
@@ -593,6 +593,69 @@ def quiz_revision_prompt(quiz,issues,stems_bad,choices_bad,final,quiz_type,quiz_
 只輸出可直接給教師使用的正式題目與答案。'''
 
 
+# v2.0：第三階段的結構化輸出由第四階段一次載入，不再重新逐欄貼上。
+def parse_learning_json(raw):
+    """Accept a single JSON object, optionally fenced by Markdown; reject unknown structures."""
+    s=raw.strip().lstrip('\ufeff')
+    s=re.sub(r'^```(?:json)?\s*', '', s, flags=re.I)
+    s=re.sub(r'\s*```$', '', s)
+    try:
+        data=json.loads(s)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f'JSON 語法錯誤：第 {exc.lineno} 行，第 {exc.colno} 欄：{exc.msg}') from exc
+    if not isinstance(data,dict):
+        raise ValueError('最外層須為 JSON 物件。')
+    texts=data.get('reading_texts')
+    if not isinstance(texts,list) or not texts or not all(isinstance(x,dict) and isinstance(x.get('content'),str) and x['content'].strip() for x in texts):
+        raise ValueError('reading_texts 必須是至少一篇、且每篇有 content 的陣列。')
+    vocab=data.get('supplementary_vocabulary',[])
+    if not isinstance(vocab,list) or not all(isinstance(x,dict) and isinstance(x.get('word'),str) and isinstance(x.get('explanation'),str) for x in vocab):
+        raise ValueError('supplementary_vocabulary 應為 {word, explanation} 的陣列。')
+    questions=data.get('questions',[])
+    if not isinstance(questions,list):
+        raise ValueError('questions 必須是陣列。')
+    for i,q in enumerate(questions,1):
+        if not isinstance(q,dict) or not isinstance(q.get('stem'),str) or not q['stem'].strip():
+            raise ValueError(f'第 {i} 題缺少 stem（題幹）。')
+        if not isinstance(q.get('options',[]),list):
+            raise ValueError(f'第 {i} 題 options 須為陣列。')
+        if not isinstance(q.get('answer',''),str):
+            raise ValueError(f'第 {i} 題 answer 須為文字。')
+    if not isinstance(data.get('instructions',''),str):
+        raise ValueError('instructions 須為字串。')
+    if not isinstance(data.get('title',''),str):
+        raise ValueError('title 須為字串。')
+    return data
+
+
+def questions_to_text(items):
+    lines=[]
+    for i,q in enumerate(items,1):
+        lines.append(f"{i}. {q['stem'].strip()}")
+        for j,opt in enumerate(q.get('options',[])):
+            label=chr(65+j) if j<26 else str(j+1)
+            option=str(opt).strip()
+            # A. B. 允許 LLM 在 option 內附上前綴，避免雙重選項標記。
+            option=re.sub(r'^[A-Z][.．、)）]\s*','',option)
+            lines.append(f'{label}. {option}')
+    return '\n'.join(lines)
+
+
+def json_to_editors(data):
+    texts=data['reading_texts']
+    body='\n\n'.join((f"{t.get('title','').strip()}\n" if t.get('title','').strip() else '')+t['content'].strip() for t in texts)
+    vocab='\n'.join(f"{v['word'].strip()}：{v['explanation'].strip()}" for v in data.get('supplementary_vocabulary',[]) if v['word'].strip())
+    answers='\n'.join(f"{i}. {q.get('answer','').strip()}" for i,q in enumerate(data['questions'],1))
+    return {'v2_title':data.get('title','閱讀測驗').strip() or '閱讀測驗',
+            'v2_body':body, 'v2_vocab':vocab,
+            'v2_instructions':data.get('instructions','').strip(),
+            'v2_questions':questions_to_text(data['questions']), 'v2_answers':answers}
+
+
+def serialize_quiz(instructions,questions):
+    return '\n'.join(x for x in [instructions.strip(),questions.strip()] if x)
+
+
 with st.sidebar:
     st.header('教材與生成設定')
     book=st.selectbox('冊別',uniq(d['冊'] for d in DATA))
@@ -651,7 +714,7 @@ attested_phrases=original_sentences+grammar_sentences
 current_key=f'{idx}:{reference}:{form}:{n}'
 if st.session_state.get('active_key')!=current_key:
     st.session_state['active_key']=current_key
-    for k in ['draft','final_text','quiz_text','answer_text','approved','last_audit','audited_text','retained_words','glossary_editor','quiz_allowed_raw','audited_names','audited_guides']:
+    for k in ['draft','final_text','quiz_text','answer_text','approved','last_audit','audited_text','retained_words','glossary_editor','quiz_allowed_raw','audited_names','audited_guides','v2_raw_json','v2_title','v2_body','v2_vocab','v2_instructions','v2_questions','v2_answers','v2_loaded','v2_show_vocab']:
         st.session_state.pop(k,None)
 
 with st.expander('查看教材來源與複現目標',expanded=False):
@@ -756,137 +819,101 @@ if report:
         st.success('已鎖定此份文本作為命題依據。')
 
 st.divider()
-st.subheader('第三階段｜依定稿文本命題')
+st.subheader('第三階段｜產生閱讀測驗 JSON')
 if not st.session_state.get('approved'):
-    st.info('請先在第二階段完成檢測，並按「確認為定稿」。')
+    st.info('請先在第二階段完成 Python 檢測並確認定稿，再產生命題 JSON。')
 else:
     final=st.session_state['final_text']
     changes=compare_changes(source,final)
-    st.markdown('**本次命題設定（可回到左側選單修改）**')
-    st.write(f'命題依據：{quiz_basis}｜題型：{quiz_type}｜題數：{quiz_qty}｜閱讀理解：{quiz_focus}')
-    st.caption('下列只是程式比對的文字差異，不代表語意、事件一定已發生變化；應由教師與 LLM 依全文確認。')
-    with st.expander('檢視原課文與新文本的文字變化線索',expanded=True):
-        if changes:
-            st.dataframe([{'原課文片段':c['原文片段'],'新文本片段':c['新文本片段']} for c in changes],hide_index=True,use_container_width=True)
-        else:
-            st.info('沒有辨識出明顯的文字差異；請確認不是照搬原課文。')
-    difference_text='\n'.join(f"- 原：{v['原文片段']}\n  新：{v['新文本片段']}" for v in changes) or '（未辨識到明顯變化）'
+    difference_text='\n'.join(f"- 原：{v['原文片段']} / 新：{v['新文本片段']}" for v in changes) or '無明顯差異'
+    retained=st.session_state.get('approved_retained',[])
+    st.write(f'命題設定：{quiz_basis}；{quiz_type}；{quiz_qty} 題；重點：{quiz_focus}')
+    st.caption('教師保留的補充生詞會直接交給 LLM 產生簡短釋義，不需於第四階段再逐詞輸入。')
     if quiz_basis=='依閱讀理解目標':
-        difference_rule='不必刻意比較原課文，依定稿閱讀文本及指定的理解目標命題。'
+        change_instruction='依新文本閱讀理解重點命題，不需要參照原課文。'
         difference_section=''
     else:
-        difference_rule=('優先從新文本中與原課文不同的重要資訊、人物決定、事件發展或結果命題；只考新文本中的內容，不要求學生讀過原課文。' if quiz_basis=='優先針對新舊文本變化' else '兼顧新文本的關鍵變化與一般閱讀理解，兩類題目皆須涵蓋。')
-        difference_section='【Python 提供的文字差異線索（僅供參考，不保證是重要情節）】\n'+difference_text
-    prompt3=f'''你是臺灣華語閱讀測驗命題教師。只依下列「定稿文本」命題，不續寫或修改文章。
-【定稿文本】
+        change_instruction=('優先針對新文本不同於原課文的關鍵資訊、行動或結果命題。' if quiz_basis=='優先針對新舊文本變化' else '兼顧新文本的內容變化及一般閱讀理解。')
+        difference_section='文字差異線索（僅供判斷，不能當成題目答案）：\n'+difference_text
+    prompt3=f'''請擔任臺灣華語閱讀測驗教師。只輸出一個有效 JSON 物件，不要 Markdown、程式碼框、出處或補充說明。
+【已定稿閱讀文本（必須原樣保留，不得續寫）】
 {final}
+【教師保留的新詞（只解釋這些詞，不要自行增加）】{'、'.join(retained) or '無'}
 {difference_section}
-【設定】題型：{quiz_type}；{quiz_qty}題；理解目標：{quiz_focus}；教師補充：{quiz_extra or '無'}。
-{difference_rule}
-【限制】題目答案只能由定稿文本支持；不可要求學生比較原課文。題幹、作答說明與選項盡量使用已學語言與臺灣繁體中文；不考無關詞義、教材來源或語法名稱。單選題每題 A～D 四選項且僅一正解，其他題型答案須可核對。
-【格式】僅輸出「閱讀測驗」及完整的 1. 至 {quiz_qty}. 題，再以「教師答案」列每題答案。不得輸出空白題目模板、對話二、原文、解析、詞語來源或教師備註。'''
+【命題】{quiz_type}，共 {quiz_qty} 題；理解重點：{quiz_focus}；依據：{quiz_basis}；補充：{quiz_extra or '無'}。
+{change_instruction} 題目必須以新文本為唯一作答依據，不要求學生比較原課文。題幹、作答說明及選項使用已學程度的繁體中文。單選題必有 A–D 四個選項、僅一正確答案；是非／簡答／排序題則提供相應答案。不可創造新故事、列詞彙來源或提供解析。
+【JSON 結構】必須使用以下鍵名與型別，questions 長度必須等於 {quiz_qty}：
+{{"title":"閱讀測驗","reading_texts":[{{"title":"文本一標題","content":"原樣保留的完整正文"}}],"supplementary_vocabulary":[{{"word":"教師保留詞","explanation":"以初級已學詞寫的短解釋"}}],"instructions":"簡短作答說明","questions":[{{"type":"single_choice / true_false / short_answer / ordering","stem":"實際題幹","options":["選項文字 A","選項文字 B","選項文字 C","選項文字 D"],"answer":"A"}}]}}
+reading_texts 必須包含全部定稿文本（{n} 篇）；補充生詞若無則輸出空陣列。選項內容不加 A. 等前綴（程式會補）；沒有選項的題型用空陣列。answer 只寫簡短答案。輸出務必能由 Python json.loads 直接解析。'''
     format_prompt(prompt3)
-    quiz_raw=st.text_area('貼回 LLM 命題結果（可直接修改）',height=250,key='quiz_text')
-    quiz_student, *quiz_answer = re.split(r'教師答案\s*[:：]?\s*',quiz_raw,maxsplit=1)
-    if st.session_state.get('quiz_answer_source')!=quiz_raw:
-        st.session_state['answer_editor']=quiz_answer[0].strip() if quiz_answer else st.session_state.get('answer_editor','')
-        st.session_state['quiz_answer_source']=quiz_raw
-    output_answer=st.text_area('教師答案（可貼入或修改；學生版不會印出）',height=110,key='answer_editor')
-    found,issues=inspect_questions(quiz_student,quiz_type,quiz_qty)
-    st.markdown('**測驗題幹、作答說明與選項的超綱檢測**')
-    st.caption('閱讀正文可以保留經教師同意的超綱詞；測驗文字須另行檢測。題幹與選項分開統計，並非以閱讀正文是否通過代替。')
-    quiz_allowed_raw=st.text_area('測驗專用允許詞（每行一詞；選填）',height=65,key='quiz_allowed_raw',placeholder='例如：已在閱讀前補充且學生能理解的必要詞')
-    quiz_allowed=uniq(re.split(r'[,，、\n]+',quiz_allowed_raw))
-    quiz_language=audit_quiz_language(quiz_student,known,allowed+quiz_allowed,text_evidence,grammar_evidence,approved_names,attested_phrases)
-    stems_bad=quiz_language['題幹與說明']['疑似超綱']
-    choices_bad=quiz_language['選項']['疑似超綱']
-    if quiz_student.strip():
-        c_stem,c_choice=st.columns(2)
-        with c_stem:
-            st.metric('題幹／說明未收錄詞次',sum(stems_bad.values()))
-            if stems_bad:
-                st.dataframe([{'疑似超綱詞':w,'次數':c} for w,c in stems_bad.most_common()],hide_index=True,use_container_width=True)
-            else:
-                st.success('目前未標記題幹或說明的疑似超綱詞。')
-        with c_choice:
-            st.metric('選項未收錄詞次',sum(choices_bad.values()))
-            if choices_bad:
-                st.dataframe([{'疑似超綱詞':w,'次數':c} for w,c in choices_bad.most_common()],hide_index=True,use_container_width=True)
-            else:
-                st.success('目前未標記選項的疑似超綱詞。')
-        st.markdown('**逐題檢測結果**')
-        per_question=audit_quiz_by_item(quiz_student,known,allowed+quiz_allowed,text_evidence,grammar_evidence,approved_names,attested_phrases)
-        if per_question: st.dataframe(per_question,hide_index=True,use_container_width=True)
-        st.caption('已先扣除生詞表、已學課文、語法例句與核准人名；剩餘為教材未收錄詞候選，仍須教師依語境核對。')
-        with st.expander('複製：測驗題目專用修訂 Prompt'):
-            format_prompt(quiz_revision_prompt(quiz_student,issues,list(stems_bad),list(choices_bad),final,quiz_type,quiz_qty,quiz_allowed))
-    if st.button('檢查題目完整性與語言難度'):
-        if stems_bad or choices_bad:
-            st.warning('題幹或選項有疑似超綱詞，請核對上方檢測結果。')
-        if not issues:
-            st.success(f'已辨識 {len(found)} 題，通過基本形式檢查。仍須由教師核對答案、干擾選項與語言難度。')
+    with st.expander('檢視新舊文本差異線索（供教師核對）'):
+        if changes:
+            st.dataframe([{'原課文':c['原文片段'],'新文本':c['新文本片段']} for c in changes],hide_index=True,use_container_width=True)
         else:
-            for issue in issues: st.warning(issue)
+            st.info('未辨識明顯的文字差異。')
+    st.info('將提示詞貼到 Copilot 或其他 LLM；把取得的完整 JSON 一次貼入第四階段。')
 
 st.divider()
-st.subheader('第四階段｜編輯與匯出 Word（隨時可用）')
-st.caption('即使命題尚未完成，也可先匯出閱讀文本；完成命題後，將題目貼到下方即可匯出完整學生版與教師版。')
-# 不能把尚未定稿的舊文本誤認為正式定稿；提供可編輯的匯出欄位。
-if st.session_state.get('approved'):
-    export_default=st.session_state.get('final_text','')
-else:
-    export_default=st.session_state.get('draft','')
-if st.session_state.get('word_source')!=export_default and not st.session_state.get('word_customized'):
-    st.session_state['word_body']=export_default
-    st.session_state['word_source']=export_default
-export_body=st.text_area('Word 閱讀正文（可直接編輯；未定稿時請自行確認內容）',key='word_body',height=230)
-if st.session_state.get('word_source')!=export_body:
-    st.session_state['word_customized']=True
-quiz_for_word=st.session_state.get('quiz_text','')
-quiz_for_word=re.split(r'教師答案\s*[:：]?\s*',quiz_for_word,maxsplit=1)[0]
-if st.session_state.get('word_quiz_source')!=quiz_for_word and not st.session_state.get('word_quiz_customized'):
-    st.session_state['word_quiz']=quiz_for_word
-    st.session_state['word_quiz_source']=quiz_for_word
-export_quiz=st.text_area('Word 測驗題目（可直接貼入或修改）',key='word_quiz',height=220)
-# 最終輸出的內容可能與第三階段不同，必須重新檢測，且不可用舊的檢測結果取代。
-if export_quiz.strip():
-    final_quiz_allowed=uniq(re.split(r'[,，、\n]+',st.session_state.get('quiz_allowed_raw','')))
-    final_quiz_audit=audit_quiz_language(export_quiz,known,allowed+final_quiz_allowed,text_evidence,grammar_evidence,approved_names,attested_phrases)
-    final_stem_bad=final_quiz_audit['題幹與說明']['疑似超綱']
-    final_choice_bad=final_quiz_audit['選項']['疑似超綱']
-    st.markdown('**Word 匯出前：最終題目語言檢測**')
-    st.caption('這裡檢查下方 Word 將實際使用的題目，不會沿用第三階段的舊結果。')
-    st.dataframe(audit_quiz_by_item(export_quiz,known,allowed+final_quiz_allowed,text_evidence,grammar_evidence,approved_names,attested_phrases),hide_index=True,use_container_width=True)
-    if final_stem_bad or final_choice_bad:
-        st.warning(f'最終題目仍有待核對詞：題幹／說明 {"、".join(final_stem_bad) or "無"}；選項 {"、".join(final_choice_bad) or "無"}。請教師核對後再下載。')
+st.subheader('第四階段｜貼入 JSON、教師編輯、下載 Word')
+st.caption('一次貼入第三階段取得的 JSON。程式自動填入閱讀文本、補充生詞、作答說明、題目和教師答案。')
+st.text_area('LLM 回傳的 JSON',height=175,key='v2_raw_json',placeholder='貼入包含 reading_texts、supplementary_vocabulary、questions 的 JSON')
+if st.button('解析 JSON 並填入以下編輯區',type='primary'):
+    try:
+        parsed=parse_learning_json(st.session_state.get('v2_raw_json',''))
+        edits=json_to_editors(parsed)
+        for k,v in edits.items():
+            st.session_state[k]=v
+        st.session_state['v2_loaded']=True
+        st.session_state['v2_show_vocab']=bool(edits['v2_vocab'].strip())
+        st.success(f"已載入 {len(parsed['reading_texts'])} 篇閱讀文本、{len(parsed.get('supplementary_vocabulary',[]))} 個補充詞及 {len(parsed['questions'])} 道題目。可直接編輯並下載 Word。")
+    except ValueError as exc:
+        st.error(str(exc))
+
+# 可從目前教師定稿建立閱讀文本初稿，毋須先生成題目。
+if st.button('只載入已定稿閱讀文本（暫不命題）'):
+    st.session_state['v2_body']=st.session_state.get('final_text') or st.session_state.get('draft','')
+    st.session_state.setdefault('v2_title',f"{book}{lesson['課']} 閱讀測驗")
+    st.session_state.setdefault('v2_vocab','')
+    st.session_state.setdefault('v2_instructions','')
+    st.session_state.setdefault('v2_questions','')
+    st.session_state.setdefault('v2_answers','')
+    st.session_state['v2_loaded']=True
+
+if st.session_state.get('v2_loaded'):
+    st.markdown('**可編輯的 Word 內容**')
+    title=st.text_input('文件標題',key='v2_title')
+    body=st.text_area('閱讀文本（可修改）',height=220,key='v2_body')
+    vocab=st.text_area('閱讀前補充生詞及解釋（可修改或刪除）',height=100,key='v2_vocab',help='由第二階段教師核准詞建立，第三階段 LLM 補上解釋；每行：詞語：解釋。')
+    show_vocab=st.checkbox('在學生版及教師版列印補充生詞',key='v2_show_vocab')
+    instructions=st.text_area('作答說明（可修改）',height=65,key='v2_instructions')
+    questions=st.text_area('閱讀理解題目及選項（可修改）',height=240,key='v2_questions')
+    answers=st.text_area('教師答案（僅教師版印出，可修改）',height=100,key='v2_answers')
+    full_quiz=serialize_quiz(instructions,questions)
+
+    # 教師有需要才檢測，第四階段不強迫重複執行語言檢測。
+    with st.expander('選用：檢測目前題幹與選項的教材未收錄詞'):
+        if st.button('檢測目前題目用詞'):
+            q_allow=uniq(re.split(r'[,，、\n]+',st.session_state.get('quiz_allowed_raw','')))
+            results=audit_quiz_by_item(full_quiz,known,allowed+q_allow,text_evidence,grammar_evidence,approved_names,attested_phrases)
+            if results:
+                st.dataframe(results,hide_index=True,use_container_width=True)
+            else:
+                st.info('目前沒有可檢測的題目。')
+            st.caption('結果僅為詞庫比對線索，教師可修改並自行決定保留。')
+    if not body.strip():
+        st.warning('閱讀正文尚未填入，不能匯出 Word。')
     else:
-        st.success('最終題幹、說明與選項未檢出教材未收錄詞（仍需人工檢查題意與答案）。')
-    _, final_form_issues=inspect_questions(export_quiz,quiz_type,quiz_qty)
-    if final_form_issues:
-        st.warning('最終題目格式待核對：'+'；'.join(final_form_issues))
-
-if st.session_state.get('word_quiz_source')!=export_quiz:
-    st.session_state['word_quiz_customized']=True
-export_answers=st.text_area('教師答案（僅教師版收錄）',value=st.session_state.get('answer_editor',''),height=90,key='word_answers')
-if not st.session_state.get('word_glossary_loaded'):
-    st.session_state['word_glossary']='\n'.join(f'{w}：' for w in st.session_state.get('approved_retained',[]))
-    st.session_state['word_glossary_loaded']=True
-export_glossary=st.text_area('閱讀前補充生詞（選填，每行：詞語：解釋）',key='word_glossary',height=100)
-show_glossary=st.checkbox('在學生版與教師版列印補充生詞',value=bool(export_glossary.strip()))
-doc_title=st.text_input('文件標題',value=f"{book}{lesson['課']} 閱讀測驗",key='word_title')
-if not export_body.strip():
-    st.warning('請先貼入閱讀正文才可下載 Word。')
+        if not questions.strip():
+            st.info('尚無測驗題，仍可先下載只有閱讀文本的 Word。')
+        actual_vocab=vocab if show_vocab else ''
+        student_doc=write_docx(body,full_quiz,'',title,actual_vocab,False)
+        teacher_doc=write_docx(body,full_quiz,answers,title,actual_vocab,True)
+        a,b=st.columns(2)
+        with a:
+            st.download_button('下載學生版 Word',data=student_doc,file_name='ReadingParallel_學生版.docx',mime='application/vnd.openxmlformats-officedocument.wordprocessingml.document',key='v2_student_download')
+        with b:
+            st.download_button('下載教師版 Word（附答案）',data=teacher_doc,file_name='ReadingParallel_教師版.docx',mime='application/vnd.openxmlformats-officedocument.wordprocessingml.document',key='v2_teacher_download')
 else:
-    if not export_quiz.strip():
-        st.info('目前只有閱讀正文，下載的是閱讀文本；命題後可再下載含測驗題的完整 Word。')
-    if not st.session_state.get('approved'):
-        st.caption('目前尚未完成教師定稿，下載前請檢查文本內容。')
-    student_doc=write_docx(export_body,export_quiz,'',doc_title,export_glossary if show_glossary else '',False)
-    teacher_doc=write_docx(export_body,export_quiz,export_answers,doc_title,export_glossary if show_glossary else '',True)
-    a,b=st.columns(2)
-    with a:
-        st.download_button('下載學生版 Word（無答案）',data=student_doc,file_name='ReadingParallel_學生版.docx',mime='application/vnd.openxmlformats-officedocument.wordprocessingml.document',key='word_student_download')
-    with b:
-        st.download_button('下載教師版 Word（附答案）',data=teacher_doc,file_name='ReadingParallel_教師版.docx',mime='application/vnd.openxmlformats-officedocument.wordprocessingml.document',key='word_teacher_download')
+    st.info('請先貼入 JSON 並按解析；也可以先載入第二階段的定稿閱讀文本。')
 
-st.caption('v1.9：精簡生成、修訂、命題提示詞；第三階段逐題檢測，第四階段對 Word 最終題目重新檢測。引導詞及 Word 排版沿用 v1.8。')
+st.caption('v2.0：第三階段輸出 JSON；第四階段一次匯入、編輯與 Word 匯出。沿用 v1.7 的 Word 題組排版及既有 Jieba 檢測。')
