@@ -785,6 +785,11 @@ def editable_quiz_checks(instructions,questions,answers,requested_qty,requested_
         issues.append(f'教師答案 {len(actual_answers)} 項，題目 {len(heads)} 題。')
     return issues
 
+def remember_draft_lesson(lesson_id):
+    """Track the context of teacher edits without changing their draft."""
+    st.session_state['draft_lesson_id'] = lesson_id
+
+
 with st.sidebar:
     st.header('教材與生成設定')
     book=st.selectbox('冊別',uniq(d['冊'] for d in DATA))
@@ -854,7 +859,8 @@ with st.sidebar:
     whole_len=count_han(whole)
     length=st.selectbox('每篇字數',['依整課課文總長度','100–150','200–300','400–500'])
     target_len={'依整課課文總長度':(max(30,round(whole_len*.8)),max(40,round(whole_len*1.2))), '100–150':(100,150),'200–300':(200,300),'400–500':(400,500)}[length]
-    cover=st.selectbox('本次目標詞覆蓋需求',['自然度優先','每篇至少60%','每篇至少80%'])
+    cover=st.selectbox('舊版覆蓋偏好（保留參考）',['自然度優先','每篇至少60%','每篇至少80%'],key='legacy_cover')
+    st.caption('主要複現要求是逐詞逐篇最低次數；舊版百分比僅保留參考，不取代最低要求，也不代表已完成正式逐篇檢測。')
     theme=st.text_input('新情境／主題（選填）', placeholder='例如：從機場接人改為在校園第一次見面')
     guiding_raw=st.text_area(
         '補充引導詞（選填，建議 2～3 個）',
@@ -942,13 +948,18 @@ with st.expander('生成提示詞',expanded=True):
 - 教師核准引導詞：{'、'.join(guiding_words) or '無'}。優先以其意義發展新情節，可自然出現，但不須全部強制出現，也不自動成為複現目標。
 - 每篇約 {target_len[0]}–{target_len[1]} 個中文字（不含標題與說話者）；{('各篇各有完整事件、篇幅接近，'+relation) if n>1 else '單篇須有完整事件'}。
 - 優先使用截至本課已學詞；必要新詞盡量少，使用臺灣繁體中文。
-- 本次目標複現詞：{'、'.join(target) or '無'}；語法：{'；'.join(gtarget) or '無'}；覆蓋要求：{cover}。須自然正確，不機械堆疊。
-- 目標詞逐篇最低次數：{target_minimum_text or "未選定目標詞"}。
+- 本次目標複現詞：{'、'.join(target) or '無'}；語法：{'；'.join(gtarget) or '無'}。須自然正確，不機械堆疊。
+- 主要複現要求：逐詞逐篇最低次數：{target_minimum_text or "未選定目標詞"}。
+- 舊版覆蓋偏好（僅供參考）：{cover}；不代表已完成正式逐篇檢測，不得降低上述最低次數。
 【輸出】僅輸出「【文本一】標題」與正文；多篇依序編號。不得輸出原課文、測驗、詞義、分析、詞彙來源或檢測報告。'''
     format_prompt(prompt1)
 
 st.subheader('第二階段｜貼回文本、Python 檢測、修訂')
-st.text_area('將 LLM 產生的閱讀文本貼在這裡（可直接修改）',height=280,key='draft')
+st.session_state.setdefault('draft_lesson_id', idx)
+if st.session_state.get('draft','').strip() and st.session_state['draft_lesson_id'] != idx:
+    st.warning('保留草稿可能來自先前課次，請確認是否適用於目前課次。此提醒不會刪改草稿，也不阻擋操作。')
+st.text_area('將 LLM 產生的閱讀文本貼在這裡（可直接修改）',height=280,key='draft',
+             on_change=remember_draft_lesson,args=(idx,))
 if st.button('執行 Python 檢測',type='primary'):
     raw=st.session_state.get('draft','').strip()
     if not raw:

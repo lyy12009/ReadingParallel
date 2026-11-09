@@ -253,6 +253,64 @@ class TargetUITests(unittest.TestCase):
         self.healthy(app)
         self.assertEqual(app.session_state['v2_body'], '新草稿')
 
+    def test_primary_minimums_are_distinct_from_legacy_cover_preference(self):
+        app = self.app()
+        self.configure(app)
+        for preference in ('每篇至少60%', '每篇至少80%'):
+            with self.subTest(preference=preference):
+                app.selectbox(key='legacy_cover').set_value(preference).run()
+                self.healthy(app)
+                prompt = next(c.value for c in app.code if '【生成條件】' in c.value)
+                self.assertIn('主要複現要求：逐詞逐篇最低次數', prompt)
+                self.assertIn('咖啡：第1篇至少1次', prompt)
+                self.assertIn('舊版覆蓋偏好（僅供參考）：' + preference, prompt)
+                self.assertIn('不代表已完成正式逐篇檢測', prompt)
+                self.assertIn('不得降低上述最低次數', prompt)
+                self.assertTrue(any('主要複現要求' in c.value and '舊版' in c.value
+                                    for c in app.caption))
+
+    def test_unaudited_draft_reminder_survives_reruns_after_lesson_change(self):
+        app = self.app()
+        app.text_area(key='draft').set_value('尚未檢測的閱讀草稿').run()
+        selectbox(app, '課別').set_value(1).run()
+        self.healthy(app)
+        self.assertEqual(app.session_state['draft'], '尚未檢測的閱讀草稿')
+        self.assertTrue(any('保留草稿可能來自先前課次' in w.value
+                            and '請確認是否適用於目前課次' in w.value for w in app.warning))
+        app.run()
+        self.assertTrue(any('保留草稿可能來自先前課次' in w.value for w in app.warning))
+        self.assertFalse(button(app, '執行 Python 檢測').disabled)
+        selectbox(app, '課別').set_value(0).run()
+        self.assertFalse(any('保留草稿可能來自先前課次' in w.value for w in app.warning))
+        self.assertEqual(app.session_state['draft'], '尚未檢測的閱讀草稿')
+
+    def test_book_change_reminds_without_carrying_old_approval(self):
+        app = self.app()
+        self.configure(app)
+        self.audit_and_approve(app)
+        draft = app.session_state['draft']
+        selectbox(app, '冊別').set_value('第二冊').run()
+        self.assert_invalid(app, draft)
+        self.assertTrue(any('保留草稿可能來自先前課次' in w.value for w in app.warning))
+        self.assertFalse(button(app, '執行 Python 檢測').disabled)
+        button(app, '執行 Python 檢測').click().run()
+        self.healthy(app)
+        self.assertFalse(app.session_state['approved'])
+        self.assertTrue(any('保留草稿可能來自先前課次' in w.value for w in app.warning))
+        app.text_area(key='draft').set_value('教師在目前課次重新編輯的草稿').run()
+        self.assertEqual(app.session_state['draft'], '教師在目前課次重新編輯的草稿')
+        self.assertFalse(any('保留草稿可能來自先前課次' in w.value for w in app.warning))
+
+    def test_empty_draft_and_same_lesson_reference_do_not_show_cross_lesson_reminder(self):
+        app = self.app()
+        selectbox(app, '課別').set_value(1).run()
+        self.assertFalse(any('保留草稿可能來自先前課次' in w.value for w in app.warning))
+        app.text_area(key='draft').set_value('本課草稿').run()
+        selectbox(app, '複現目標（來源文本）').set_value('對話2').run()
+        self.healthy(app)
+        self.assertFalse(any('保留草稿可能來自先前課次' in w.value for w in app.warning))
+        self.assertEqual(app.session_state['draft'], '本課草稿')
+
     def test_new_target_gets_one_without_destroying_saved_settings(self):
         app = self.app()
         self.configure(app)

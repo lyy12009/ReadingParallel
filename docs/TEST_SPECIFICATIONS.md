@@ -200,3 +200,16 @@ git diff --check
 本批未實作N06–N09的逐篇正式詞次與歧義判斷、N12–N18的完整提示詞／修訂驗收及W01–W08衝突評估。個別既有功能可能符合其中部分敘述，不能據此宣稱整項新規格通過。
 
 執行命令仍為第一至七節列出的unittest discover及兩個smoke腳本，會自動包含新增測試。完整測試與冒煙結果於交付報告記錄；教材、字典、requirements及原有測試檔需與分支基準一致。設定表是要求資料，不是逐篇正式檢測結果，不能以新介面測試通過聲稱T12已完成。
+
+### PR #3 審查追加的實際測試
+
+在test_target_vocabulary.py新增4項AppTest，該檔由16項增為20項（4項純邏輯、16項AppTest），連同原有9項共29項。原有9項及兩個冒煙腳本不變。
+
+| 方法 | 驗證範圍 |
+|---|---|
+| test_primary_minimums_are_distinct_from_legacy_cover_preference | 切換60%與80%仍保留選項；UI及prompt1明示主要最低次數、舊版僅供參考、不代表正式逐篇檢測、不降低主要要求 |
+| test_unaudited_draft_reminder_survives_reruns_after_lesson_change | 未檢測非空草稿跨課提醒；rerun仍顯示；文字不變、檢測按鈕可用；返回記錄課次不誤警告 |
+| test_book_change_reminds_without_carrying_old_approval | 已核准草稿跨冊提醒，舊報告／核准失效；仍可執行檢測，提醒不阻擋；教師在目前課次編輯後更新來源記錄 |
+| test_empty_draft_and_same_lesson_reference_do_not_show_cross_lesson_reminder | 空草稿或同課切換參考文本不顯示跨課草稿提醒，教師文字不變 |
+
+先以新增案例重現缺少明確主次標識及跨課提醒，再做最小修正。這些測試不驗證正式逐篇詞次、歧義演算法或第二批功能。AppTest是程式化介面測試；實際瀏覽器人工驗收仍獨立。
