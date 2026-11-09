@@ -20,6 +20,7 @@ if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 from target_settings import combine_targets, minimum_matrix, configuration_signature, invalidate_audit
 from vocabulary_audit import audit_per_text
+from revision_prompts import revision_plan, revision_prompt
 DATA = json.loads((HERE / 'corpus.json').read_text(encoding='utf-8'))
 
 # 專案既有繁體大字典優先：GitHub repo 根目錄，其次 dictionaries/。
@@ -928,7 +929,9 @@ known=get_lexicon(idx)
 text_evidence, grammar_evidence, original_sentences, grammar_sentences=curriculum_evidence(idx)
 attested_phrases=original_sentences+grammar_sentences
 target_snapshot = configuration_signature({**target_config, 'reference': reference, 'form': form,
-                                             'allowed': sorted(allowed), 'names': sorted(approved_names)})
+                                             'allowed': sorted(allowed), 'names': sorted(approved_names),
+                                             'guides': guiding_words, 'length': target_len,
+                                             'theme': theme, 'relation': relation, 'cover': cover})
 text_changed = ('audited_text' in st.session_state and
                 st.session_state['audited_text'] != st.session_state.get('draft',''))
 if st.session_state.get('active_target_settings') != target_snapshot or text_changed:
@@ -968,12 +971,14 @@ with st.expander('生成提示詞',expanded=True):
 【生成條件】
 - 事件目的、關鍵資訊或結果須與原文不同；不能只改姓名、地點或順序。{('情境：'+theme+'。') if theme else ''}
 - 教師核准人名／說話者：{'、'.join(approved_names) or '無；不使用人名'}；不可自行新增。
-- 教師核准引導詞：{'、'.join(guiding_words) or '無'}。優先以其意義發展新情節，可自然出現，但不須全部強制出現，也不自動成為複現目標。
+{('- 教師核准引導詞：'+'、'.join(guiding_words)+'。以其意義發展新情節，不強制全部出現，也不自動成為複現目標。') if guiding_words else ''}
+{('- 教師一般允許詞：'+'、'.join(allowed)+'；不自動成為複現目標。') if allowed else ''}
 - 每篇約 {target_len[0]}–{target_len[1]} 個中文字（不含標題與說話者）；{('各篇各有完整事件、篇幅接近，'+relation) if n>1 else '單篇須有完整事件'}。
 - 優先使用截至本課已學詞；必要新詞盡量少，使用臺灣繁體中文。
 - 本次目標複現詞：{'、'.join(target) or '無'}；語法：{'；'.join(gtarget) or '無'}。須自然正確，不機械堆疊。
 - 主要複現要求：逐詞逐篇最低次數：{target_minimum_text or "未選定目標詞"}。
 - 舊版覆蓋偏好（僅供參考）：{cover}；不代表已完成正式逐篇檢測，不得降低上述最低次數。
+【輸出前自行核對】核對以上條件，但不輸出逐項分析或檢測報告；Python才是可量化條件的正式檢測依據。
 【輸出】僅輸出「【文本一】標題」與正文；多篇依序編號。不得輸出原課文、測驗、詞義、分析、詞彙來源或檢測報告。'''
     format_prompt(prompt1)
 
@@ -1001,6 +1006,8 @@ if st.button('執行 Python 檢測',type='primary'):
         st.session_state['audited_guides']=tuple(sorted(guiding_words))
         st.session_state['audited_target_settings']=target_snapshot
         st.session_state['approved']=False
+st.text_area('教師修訂意見', key='revision_notes',
+             placeholder='保留人物與結局、調整語氣等；意見不會自動改動最低次數。')
 report=st.session_state.get('last_audit')
 if report:
     c1,c2,c3,c4=st.columns(4)
@@ -1052,20 +1059,38 @@ if report:
     with st.expander('補充生詞說明（可於第四階段編輯）',expanded=bool(retained)):
         st.code('\n'.join(f'{w}：' for w in retained) if retained else '目前尚未選擇保留詞',language='text')
     with st.expander('生成修訂提示詞（選用）'):
-        st.caption('此處保留舊版修訂流程；字串未命中僅供參考，尚未依逐篇正式結果自動產生不足項修訂。')
-        notes=st.text_area('教師修訂意見',placeholder='例如：保留人物，但改變事件；增加當課未使用詞；調整自然度。')
-        lack='、'.join(w for w,c in report['目標詞複現'].items() if not c) or '無'
-        to_repair='、'.join(f'{w}({c})' for w,c in report['疑似超綱'].most_common(45) if w not in retained) or '無'
-        prompt2=f'''請只修改以下華語閱讀文本，保留故事整體、篇數及自然度，勿續寫原課文。
-【原課文，僅供辨識重複】
-{source}
-【待修訂文本】
-{st.session_state['draft']}
-【教師意見】{notes or '優先檢查未收錄詞、自然度及複現'}
-【檢測線索（不等於確定錯誤）】待核對詞：{to_repair}；舊版字串未命中（僅供參考）：{lack}；與原文相似度：{report['整體字元相似度']:.0%}。
-核准引導詞：{'、'.join(guiding_words) or '無'}；必須保留的補充詞：{'、'.join(retained) or '無'}。
-【要求】先核對斷詞誤判，再必要時以已學詞改寫；引導情節及核准詞不可無故刪除。每篇約{target_len[0]}–{target_len[1]}字；如過度照搬原文，須改變目的、資訊或結果。僅輸出完整修訂文本，不附分析或出處。'''
-        format_prompt(prompt2)
+        plan = revision_plan(
+            report.get('逐篇複現'), target_config, st.session_state.get('draft', ''),
+            st.session_state.get('audited_text'), target_snapshot,
+            st.session_state.get('audited_target_settings'))
+        notes = st.session_state.get('revision_notes', '')
+        if notes.strip():
+            st.warning('教師意見若與原設定衝突，請核對後再修訂；系統不會自動判斷一般語意衝突或降低最低要求。')
+        if not plan['valid']:
+            st.warning('沒有目前有效且完整的逐篇檢測結果，請重新執行 Python 檢測。')
+        else:
+            if plan['deficits']:
+                st.markdown('**正式不足項目（僅明確未達標）**')
+                st.dataframe(plan['deficits'], hide_index=True, use_container_width=True)
+            elif plan['all_met']:
+                st.info('目前選定目標的確定詞次均已達標；這不代表語意、自然度或整體教學品質已通過。可選用一般文字修訂。')
+            if plan['reviews'] or plan['issues']:
+                st.info('另有待人工核對項目；可疑匹配、未知詞次與漏篇不自動列為補寫要求。請核對上方分篇與歧義證據。')
+                if plan['reviews']:
+                    st.dataframe(plan['reviews'], hide_index=True, use_container_width=True)
+            if plan['issues']:
+                st.info('分篇、設定或斷詞有待核對問題，暫不產生修訂提示詞；先確認原文與設定，再重新檢測。已知缺額仍列示，不推定漏篇內容。')
+            if not plan['deficits'] and not plan['all_met']:
+                st.info('目前沒有可自動要求補足的明確不足項目；請先核對分篇、設定或歧義。不虛構缺額。')
+            revision_context = dict(
+                source=source, book=book, lesson=lesson['課'], form=form, text_count=n,
+                relation=relation, length=target_len, theme=theme, grammar=gtarget,
+                names=approved_names, guides=guiding_words, allowed=allowed,
+                retained=retained, cover=cover)
+            prompt2 = revision_prompt(plan, st.session_state['draft'], revision_context, notes)
+            if prompt2:
+                format_prompt(prompt2)
+                st.caption('提示詞僅代表目前草稿與設定的修訂建議。貼回修訂稿後須重新檢測，再由教師人工確認定稿。')
     st.markdown('**教師確認定稿**')
     st.caption('檢測後如要人工修改，請重新檢測。確認前不能進行命題。')
     st.caption('定稿是教師人工決定，不會把未達標或待核對的逐篇結果自動改成達標；請先核對表格、分篇與歧義證據。')
