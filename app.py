@@ -614,6 +614,9 @@ def parse_learning_json(raw):
     texts=data.get('reading_texts')
     if not isinstance(texts,list) or not texts or not all(isinstance(x,dict) and isinstance(x.get('content'),str) and x['content'].strip() for x in texts):
         raise ValueError('reading_texts 必須是至少一篇、且每篇有 content 的陣列。')
+    for i,text in enumerate(texts,1):
+        if not isinstance(text.get('title',''),str):
+            raise ValueError(f'第 {i} 篇閱讀文本 title 須為字串。')
     vocab=data.get('supplementary_vocabulary',[])
     if not isinstance(vocab,list) or not all(
         isinstance(x,dict) and isinstance(x.get('word'),str) and (
@@ -636,6 +639,8 @@ def parse_learning_json(raw):
     for i,q in enumerate(questions,1):
         if not isinstance(q,dict) or not isinstance(q.get('stem'),str) or not q['stem'].strip():
             raise ValueError(f'第 {i} 題缺少 stem（題幹）。')
+        if not isinstance(q.get('type','single_choice'),str):
+            raise ValueError(f'第 {i} 題 type 須為字串。')
         if not isinstance(q.get('options',[]),list):
             raise ValueError(f'第 {i} 題 options 須為陣列。')
         if not isinstance(q.get('answer',''),str):
@@ -974,7 +979,7 @@ else:
 【第二階段核准的閱讀補充生詞】{'、'.join(retained) or '無'}
 【生詞解釋語言：每種都要提供】{glossary_language_text or 'English（英語）'}。解釋簡短、自然、準確；繁體中文解釋優先用已學詞，其他語言直接用該語言，不強求華語解釋。
 {difference_section}
-【命題設定】{quiz_type}，{quiz_qty} 題；理解重點：{quiz_focus}；命題依據：{quiz_basis}；補充要求：{quiz_extra or '無'}。
+【命題設定】{quiz_type}，{quiz_qty} 題；理解重點：{quiz_focus}；命題依據：{quiz_basis}。
 {change_instruction} 只考核定稿文本，不能要求比較原文。題幹、選項、作答說明均用臺灣繁體中文。單選題四個不同選項且只有一個答案；其他題型依類別提供答案。
 【生成後必做兩輪自檢；不得只宣稱通過】
 第一輪（內容）：逐題核對答案是否能由定稿文本支持、選項有無歧義或多個正解、題數題型是否符合、是否測閱讀理解。發現問題先修改。
