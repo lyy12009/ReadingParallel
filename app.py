@@ -22,6 +22,7 @@ from target_settings import combine_targets, minimum_matrix, configuration_signa
 from vocabulary_audit import audit_per_text
 from revision_prompts import revision_plan, revision_prompt
 from generation_constraints import summarize_constraints
+from learned_vocabulary import classify_learned_word, exemption_table, quiz_review_table, VOCABULARY_RULE_VERSION
 DATA = json.loads((HERE / 'corpus.json').read_text(encoding='utf-8'))
 
 # 專案既有繁體大字典優先：GitHub repo 根目錄，其次 dictionaries/。
@@ -215,7 +216,7 @@ def explicit_names_from_source(source):
 
 
 @st.cache_data(show_spinner=False)
-def lesson_segmented_corpus(upto: int, dict_version: str):
+def lesson_segmented_corpus(upto: int, dict_version: str, include_sources=False):
     """重建至目標課為止的全課文分詞集合；不同於本課生詞表。
 
     現有 corpus.json 未保存原始教材斷詞欄位，這是依課文及指定 Jieba 字典
@@ -223,17 +224,26 @@ def lesson_segmented_corpus(upto: int, dict_version: str):
     """
     from_text=set()
     source_sentences=[]
-    for d in DATA[:upto+1]:
-        for part in PARTS:
+    single_sources={}
+    for index, d in enumerate(DATA[:upto+1]):
+        for order, part in enumerate(PARTS):
             raw=d.get(part,'')
-            for line in raw.splitlines():
+            for line_number, line in enumerate(raw.splitlines(), 1):
                 # 除去說話者標記，保留正文、避免姓名干擾詞庫
                 body=re.sub(r'^\s*[^：:\n]{1,12}[：:]\s*', '',line)
                 for sentence in re.split(r'[，。！？；：、,.!?;：\s]+',body):
                     sentence=sentence.strip()
                     if not sentence: continue
                     source_sentences.append(sentence)
-                    from_text.update(w for w in TOKENIZER.lcut(sentence,HMM=False) if HAN_RE.search(w))
+                    tokens = [w for w in TOKENIZER.lcut(sentence,HMM=False) if HAN_RE.search(w)]
+                    from_text.update(tokens)
+                    for word in tokens:
+                        if len(word) == 1 and HAN_RE.fullmatch(word):
+                            single_sources.setdefault(word, {
+                                '冊': d['冊'], '課': d['課'], '來源': part, '資料索引': index,
+                                '部分序': order, '行號': line_number, '原句': sentence})
+    if include_sources:
+        return from_text, tuple(source_sentences), single_sources
     return from_text, tuple(source_sentences)
 
 
@@ -253,6 +263,23 @@ def curriculum_evidence(upto):
                     # 短語如「貴姓」可能被 Jieba 拆成單字；連續出現即應有教材證據。
                     if '貴姓' in example: from_grammar.add('貴姓')
     return from_text, from_grammar, source_sentences, tuple(grammar_sentences)
+
+
+def curriculum_character_sources(upto):
+    """First exact single-token evidence in the same curriculum prefix."""
+    result = {}
+    for index, lesson in enumerate(DATA[:upto+1]):
+        for order, part in enumerate(PARTS):
+            for word in words(lesson, [part]):
+                if len(word) == 1 and HAN_RE.fullmatch(word):
+                    result.setdefault(word, {}).setdefault('教材生詞', {
+                        '冊': lesson['冊'], '課': lesson['課'], '來源': part + '生詞',
+                        '資料索引': index, '部分序': order})
+    version=f'{BIG_DICT}:{BIG_DICT.stat().st_mtime if BIG_DICT else 0}'
+    _, _, text_sources = lesson_segmented_corpus(upto, version, include_sources=True)
+    for word, origin in text_sources.items():
+        result.setdefault(word, {})['已學課文斷詞'] = origin
+    return result
 
 
 def speaker_warnings(text,approved_names):
@@ -288,7 +315,7 @@ def _curriculum_segment(fragment, by_first):
     return out
 
 
-def audit(text,known,target,original,allow,text_evidence=None,grammar_evidence=None,names=None,attested_phrases=None):
+def audit(text,known,target,original,allow,text_evidence=None,grammar_evidence=None,names=None,attested_phrases=None,character_sources=None):
     text_evidence=set(text_evidence or [])
     grammar_evidence=set(grammar_evidence or [])
     names=set(names or [])
@@ -304,27 +331,45 @@ def audit(text,known,target,original,allow,text_evidence=None,grammar_evidence=N
     for f in fragments:
         tokens.extend(_curriculum_segment(f, by_first))
     # Lexicon-based greedy scan prioritizes explicit known multi-character words.
-    # Does not infer that individual known characters license a new compound word.
+    # Token boundaries stay unchanged; the curriculum-only exemption is classification below.
     unknown=Counter()
     evidence_counts=Counter()
     counts={w:len(re.findall(re.escape(w), normalized)) for w in target}
     known_set=baseline | set('的一了是不我你他她們嗎呢啊有在和也都很去來說要會')
+    exemptions = {}
+    classified_words = {}
     for w in tokens:
         if not HAN_RE.search(w):
             continue
-        if w in names: evidence_counts['教師確認人名'] += 1
-        elif w in known: evidence_counts['已學生詞'] += 1
-        elif w in grammar_evidence: evidence_counts['語法例句'] += 1
-        elif w in text_evidence or (len(w)>1 and any(w in phrase for phrase in attested_phrases)): evidence_counts['已學課文連續用詞'] += 1
-        elif w in allow: evidence_counts['教師允許詞'] += 1
-        elif w in known_set: evidence_counts['常見功能詞'] += 1
-        else: unknown[w]+=1
+        decision = classify_learned_word(w, known, text_evidence, character_sources)
+        if decision:
+            category = decision['判定來源']
+        elif w in names:
+            category = '教師確認人名'
+        elif w in grammar_evidence:
+            category = '語法例句'
+        elif w in allow:
+            category = '教師允許詞'
+        elif w in known_set:
+            category = '常見功能詞'
+        else:
+            unknown[w] += 1
+            continue
+        evidence_counts[category] += 1
+        record = classified_words.setdefault(w, {'原詞': w, '判定來源': category, '原詞出現次數': 0})
+        record['原詞出現次數'] += 1
+        if category == '已學單字組合豁免':
+            record = exemptions.setdefault(w, {
+                '原詞': w, '單字證據': decision['單字證據'],
+                '原詞出現次數': 0, '判定結果': category})
+            record['原詞出現次數'] += 1
     overlap,examples=ngram_overlap(original,text)
     old=normalize_text(original); new=normalize_text(text)
     sim=SequenceMatcher(None,old,new,autojunk=False).ratio() if old and new else 0
     return {'字數':count_han(text),'目標詞複現':counts,'疑似超綱':unknown,'疑似超綱詞次':sum(unknown.values()),
             '全文中文字詞次':sum(1 for w in tokens if HAN_RE.search(w)), '已學證據分類':evidence_counts,
-            '原文連續片段重合率':overlap,'整體字元相似度':sim,'重合片段':examples}
+            '原文連續片段重合率':overlap,'整體字元相似度':sim,'重合片段':examples,
+            '已學單字組合豁免':list(exemptions.values()), '詞彙判定紀錄':list(classified_words.values())}
 
 
 
@@ -575,14 +620,14 @@ def extract_quiz_language(quiz):
     return '\n'.join(heads), '\n'.join(choices)
 
 
-def audit_quiz_language(quiz, known, allow, text_evidence=None, grammar_evidence=None, names=None, attested_phrases=None):
+def audit_quiz_language(quiz, known, allow, text_evidence=None, grammar_evidence=None, names=None, attested_phrases=None, character_sources=None):
     question_stems, choices=extract_quiz_language(quiz)
-    r1=audit(question_stems,known,[], '',allow,text_evidence,grammar_evidence,names,attested_phrases)
-    r2=audit(choices,known,[], '',allow,text_evidence,grammar_evidence,names,attested_phrases)
+    r1=audit(question_stems,known,[], '',allow,text_evidence,grammar_evidence,names,attested_phrases,character_sources)
+    r2=audit(choices,known,[], '',allow,text_evidence,grammar_evidence,names,attested_phrases,character_sources)
     return {'題幹與說明':r1,'選項':r2}
 
 
-def audit_quiz_by_item(raw, known, allow, text_evidence=None, grammar_evidence=None, names=None, attested_phrases=None):
+def audit_quiz_by_item(raw, known, allow, text_evidence=None, grammar_evidence=None, names=None, attested_phrases=None, character_sources=None):
     """逐題檢查；題目前的作答說明也納入，避免只報總數。"""
     header=re.compile(r'^\s*(?:\d{1,2}[.．、)）]|[（(]\d{1,2}[)）]|第[一二三四五六七八九十\d]+題)\s*')
     lines=raw.splitlines()
@@ -598,11 +643,15 @@ def audit_quiz_by_item(raw, known, allow, text_evidence=None, grammar_evidence=N
     if current and any(x.strip() for x in current): groups.append((label,'\n'.join(current)))
     output=[]
     for label,body in groups:
-        checked=audit_quiz_language(body,known,allow,text_evidence,grammar_evidence,names,attested_phrases)
+        checked=audit_quiz_language(body,known,allow,text_evidence,grammar_evidence,names,attested_phrases,character_sources)
         stems=checked['題幹與說明']['疑似超綱']; choices=checked['選項']['疑似超綱']
         output.append({'區塊':label,'題幹／說明待核對':'、'.join(stems) or '—',
                        '選項待核對':'、'.join(choices) or '—',
-                       '待核對詞次':sum(stems.values())+sum(choices.values())})
+                       '待核對詞次':sum(stems.values())+sum(choices.values()),
+                       '已學單字組合豁免明細':[
+                           {**record, '區塊': label, '區域': area}
+                           for area, result in checked.items()
+                           for record in result['已學單字組合豁免']]})
     return output
 
 
@@ -767,14 +816,14 @@ def inspect_structured_quiz(data, expected_type=None, expected_qty=None):
     return issues
 
 
-def quiz_vocab_review(instructions,questions,glossary_words,known,allowed,text_evidence,grammar_evidence,approved_names,attested_phrases):
+def quiz_vocab_review(instructions,questions,glossary_words,known,allowed,text_evidence,grammar_evidence,approved_names,attested_phrases,character_sources=None):
     """Separate genuinely unaccounted words from supplied supplementary terms."""
     glossary_words={w.strip() for w in glossary_words if w.strip()}
     base_allow=set(allowed)
     rows=audit_quiz_by_item(serialize_quiz(instructions,questions),known,base_allow,
-                            text_evidence,grammar_evidence,approved_names,attested_phrases)
+                            text_evidence,grammar_evidence,approved_names,attested_phrases,character_sources)
     covered_rows=audit_quiz_by_item(serialize_quiz(instructions,questions),known,base_allow|glossary_words,
-                                    text_evidence,grammar_evidence,approved_names,attested_phrases)
+                                    text_evidence,grammar_evidence,approved_names,attested_phrases,character_sources)
     for row,covered in zip(rows,covered_rows):
         initial=set((row['題幹／說明待核對']+'、'+row['選項待核對']).replace('—','').split('、'))-set([''])
         rest=set((covered['題幹／說明待核對']+'、'+covered['選項待核對']).replace('—','').split('、'))-set([''])
@@ -928,8 +977,12 @@ with st.sidebar:
 source=lesson[reference]; gtarget=grammar(lesson,[reference])
 known=get_lexicon(idx)
 text_evidence, grammar_evidence, original_sentences, grammar_sentences=curriculum_evidence(idx)
+character_sources = curriculum_character_sources(idx)
 attested_phrases=original_sentences+grammar_sentences
-target_snapshot = configuration_signature({**target_config, 'reference': reference, 'form': form,
+if 'retained_words' in st.session_state:
+    st.session_state['retained_words_saved'] = list(st.session_state['retained_words'])
+target_snapshot = configuration_signature({**target_config, 'vocabulary_rule': VOCABULARY_RULE_VERSION,
+                                             'reference': reference, 'form': form,
                                              'allowed': sorted(allowed), 'names': sorted(approved_names),
                                              'guides': guiding_words, 'length': target_len,
                                              'theme': theme, 'relation': relation, 'cover': cover})
@@ -1027,7 +1080,7 @@ if st.button('執行 Python 檢測',type='primary'):
     if not raw.strip():
         st.warning('請先貼入文本。')
     else:
-        report=audit(raw,known,target,source,allowed,text_evidence,grammar_evidence,approved_names,attested_phrases)
+        report=audit(raw,known,target,source,allowed,text_evidence,grammar_evidence,approved_names,attested_phrases,character_sources)
         report['逐篇複現']=per_text_target_audit(raw,target_config,known,allowed,text_evidence,grammar_evidence,approved_names)
         header_lines = {piece['header_line'] for piece in report['逐篇複現']['pieces']}
         speaker_body = '\n'.join(line for number, line in enumerate(raw.splitlines(), 1)
@@ -1048,8 +1101,15 @@ if report:
     c2.metric('舊版彙總命中目標（參考）',f"{sum(bool(v) for v in report['目標詞複現'].values())}/{len(target)}")
     c3.metric('教材未收錄詞次',report['疑似超綱詞次'])
     c4.metric('與原文相似度',f"{report['整體字元相似度']:.0%}")
-    st.caption('先採截至本課的全課文斷詞與課文連續用詞，再對照生詞表、語法例句、歷來已學人名與教師允許詞。未找到的項目仍需核對。')
+    st.caption('依截至本課整詞生詞表、整詞課文斷詞，再核對雙字詞的兩個完整已學單字詞；語法、人名、允許詞與功能詞規則保留。豁免不等於詞義或教學適切性已通過。')
     st.write('**檢測依據統計：**', '；'.join(f'{k} {v} 詞次' for k,v in report['已學證據分類'].items()))
+    with st.expander('已學單字組合豁免（閱讀文本，供教師核對）', expanded=False):
+        st.caption('僅疑似超綱分類採用雙字豁免；不代表詞義／教學適切性或正式目標詞次已通過。')
+        if report['已學單字組合豁免']:
+            st.dataframe(exemption_table(report['已學單字組合豁免']), hide_index=True, use_container_width=True)
+            st.json(report['已學單字組合豁免'])
+        else:
+            st.caption('本次沒有適用的已學單字組合豁免。')
     per_text = report['逐篇複現']
     st.markdown('**逐詞逐篇檢測（Python）**')
     st.caption('確定詞次須為教材優先斷詞與同一Jieba結果邊界一致的完整詞；可疑候選不算確定詞次。確定不足量＝最低要求減確定詞次（至少0）；有歧義時仍須教師核對最終缺額。缺篇或格式不明以空值及待核對呈現。')
@@ -1081,11 +1141,12 @@ if report:
         st.dataframe([{'詞':w,'次數':v} for w,v in report['疑似超綱'].most_common()],hide_index=True,use_container_width=True)
     st.markdown('**保留少量超綱詞，作為閱讀前補充生詞**')
     st.caption('大量閱讀可以接觸少量尚未教過、但有助於理解的詞。勾選保留不代表已學；教師可在下方為學生提供簡短解釋。')
-    suspect_options=list(report['疑似超綱'].keys())
     if 'retained_words' not in st.session_state:
-        st.session_state['retained_words']=[]
-    st.session_state['retained_words']=[w for w in st.session_state['retained_words'] if w in suspect_options]
+        st.session_state['retained_words']=list(st.session_state.get('retained_words_saved', []))
+    suspect_options=uniq(list(report['疑似超綱'].keys()) + st.session_state['retained_words'])
+    st.caption('已選保留詞即使因新證據或豁免不再疑似超綱，仍保留供教師決定；不自動刪除既有補充解釋。')
     retained=st.multiselect('教師決定保留的疑似超綱詞（不要求 LLM 刪除）',suspect_options,key='retained_words')
+    st.session_state['retained_words_saved'] = list(retained)
     if retained:
         st.caption('下列詞語解釋可稍後放在學生閱讀文本前；請由教師填寫，系統不會自動捏造詞義。')
     # Display selected vocabulary as explicit candidates; explanations remain teacher-written.
@@ -1241,7 +1302,15 @@ if st.session_state.get('v2_loaded'):
     q_allow=uniq(re.split(r'[,，、\n]+',st.session_state.get('quiz_allowed_raw','')))
     if questions.strip():
         review_rows=quiz_vocab_review(instructions,questions,glossary_words,known,allowed+q_allow,
-                                      text_evidence,grammar_evidence,approved_names,attested_phrases)
+                                      text_evidence,grammar_evidence,approved_names,attested_phrases,character_sources)
+        with st.expander('已學單字組合豁免（測驗說明、題幹與選項）', expanded=False):
+            quiz_exemptions = [record for row in review_rows for record in row['已學單字組合豁免明細']]
+            st.caption('沿用閱讀正文同一判定；豁免詞不自動要求補充解釋，已輸入的詞語及解釋不刪除。')
+            if quiz_exemptions:
+                st.dataframe(exemption_table(quiz_exemptions), hide_index=True, use_container_width=True)
+                st.json(quiz_exemptions)
+            else:
+                st.caption('目前測驗沒有適用的已學單字組合豁免。')
         unexpected=[r for r in review_rows if r['尚未解決']!='—']
         covered=[r for r in review_rows if r['已由補充生詞涵蓋']!='—']
         structure_problems=editable_quiz_checks(instructions,questions,answers,quiz_qty,quiz_type)
@@ -1249,7 +1318,7 @@ if st.session_state.get('v2_loaded'):
         if unexpected or structure_problems or st.session_state.get('v22_json_vocab_issues') or st.session_state.get('v22_warnings'):
             st.warning(f'題目檢查：{len(unexpected)} 個區塊仍有教材未收錄詞，{len(structure_problems)} 項格式／一致性提醒。請核對後可自行決定是否匯出。')
             with st.expander('查看自動檢測異常（不妨礙編輯與匯出）',expanded=True):
-                if unexpected:st.dataframe(unexpected,hide_index=True,use_container_width=True)
+                if unexpected:st.dataframe(quiz_review_table(unexpected),hide_index=True,use_container_width=True)
                 for issue in structure_problems+st.session_state.get('v22_json_vocab_issues',[])+st.session_state.get('v22_warnings',[]):
                     st.write('• '+str(issue))
         elif covered:
@@ -1260,9 +1329,9 @@ if st.session_state.get('v2_loaded'):
     with st.expander('選用：查看完整逐題詞彙比對'):
         if st.button('顯示完整逐題檢測表'):
             q_allow=uniq(re.split(r'[,，、\n]+',st.session_state.get('quiz_allowed_raw','')))
-            results=audit_quiz_by_item(full_quiz,known,allowed+q_allow,text_evidence,grammar_evidence,approved_names,attested_phrases)
+            results=audit_quiz_by_item(full_quiz,known,allowed+q_allow,text_evidence,grammar_evidence,approved_names,attested_phrases,character_sources)
             if results:
-                st.dataframe(results,hide_index=True,use_container_width=True)
+                st.dataframe(quiz_review_table(results),hide_index=True,use_container_width=True)
             else:
                 st.info('目前沒有可檢測的題目。')
             st.caption('結果僅為詞庫比對線索，教師可修改並自行決定保留。')
