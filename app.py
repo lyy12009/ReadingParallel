@@ -21,6 +21,7 @@ if str(HERE) not in sys.path:
 from target_settings import combine_targets, minimum_matrix, configuration_signature, invalidate_audit
 from vocabulary_audit import audit_per_text
 from revision_prompts import revision_plan, revision_prompt
+from generation_constraints import summarize_constraints
 DATA = json.loads((HERE / 'corpus.json').read_text(encoding='utf-8'))
 
 # 專案既有繁體大字典優先：GitHub repo 根目錄，其次 dictionaries/。
@@ -964,6 +965,38 @@ with st.expander('查看本次逐詞逐篇最低要求', expanded=False):
                  hide_index=True, use_container_width=True)
 
 st.subheader('第一階段｜生成真正的新文本')
+st.markdown('生成條件摘要與提醒（不阻擋）')
+constraint_context = dict(
+    book=book, lesson=lesson['課'], reference=reference, source=source, form=form,
+    relation=relation, theme=theme, names=approved_names, grammar=gtarget,
+    guides=guiding_words, allowed=allowed, legacy_cover=cover,
+    learned_scope=f'{book}{lesson["課"]}截至本課的既有教材詞彙證據',
+)
+constraint_summary = summarize_constraints(target_config, target_len, constraint_context, CJK_WORD)
+st.caption('目前量化要求：不同目標詞數量與最低總詞次分開計算；總詞次為各詞最低要求相加，不是已生成文本的實際詞次。')
+st.dataframe(constraint_summary['rows'], hide_index=True, use_container_width=True)
+with st.expander('本次提醒依據：各詞最低次數與其他生成條件', expanded=False):
+    if constraint_summary['minimums']:
+        st.dataframe(constraint_summary['minimums'], hide_index=True, use_container_width=True)
+    else:
+        st.caption('未設定目標複現詞；0項／0次只表示設定數量，不代表教學達標。')
+    st.write('核准人名／說話者：', '、'.join(constraint_summary['context']['names']) or '無')
+    st.write('目標語法：', '；'.join(constraint_summary['context']['grammar']) or '原課文未載')
+    st.write('引導詞：', '、'.join(constraint_summary['context']['guides']) or '未設定')
+    st.write('一般允許集合（沿用現有引導詞核准）：', '、'.join(constraint_summary['context']['allowed']) or '未設定')
+    st.write('形式／多篇關係／情境：', form, relation, theme or '未另指定')
+    st.caption('人名、語法與情境僅列設定依據，不推算必然佔用字數；引導詞與允許詞不自動加入複現目標。')
+    st.caption('計算版本：' + constraint_summary['method'])
+if constraint_summary['issues']:
+    for issue in constraint_summary['issues']:
+        st.warning('A｜已確認的設定／格式問題：' + issue['依據'])
+else:
+    st.caption('A｜目前未發現上述設定格式問題；這不表示生成必定可行或教學品質已通過。')
+for risk in constraint_summary['risks']:
+    st.info('B｜可行性待教師評估：' + risk['說明'])
+for detail in constraint_summary['unassessed']:
+    st.caption('C｜' + detail)
+st.caption('提醒不會調整目標、最低次數、篇幅、篇數或教師輸入。可保留原設定，直接使用下方生成提示詞。')
 with st.expander('生成提示詞',expanded=True):
     prompt1=f'''你是臺灣華語教材編寫者。依下列原課文生成 {n} 篇全新{form}，供{book}{lesson['課']}學生練習。
 【原課文（僅參考主題，不可改寫、續寫或照搬）】
