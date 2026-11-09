@@ -19,6 +19,7 @@ HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 from target_settings import combine_targets, minimum_matrix, configuration_signature, invalidate_audit
+from vocabulary_audit import audit_per_text
 DATA = json.loads((HERE / 'corpus.json').read_text(encoding='utf-8'))
 
 # 專案既有繁體大字典優先：GitHub repo 根目錄，其次 dictionaries/。
@@ -257,6 +258,15 @@ def speaker_warnings(text,approved_names):
     return [n for n in names_from_dialogue(text) if n not in allowed]
 
 
+
+def curriculum_word_index(baseline):
+    """Shared learned/allowed-word precedence; targets are never added here."""
+    by_first = {}
+    for word in sorted((w for w in baseline if len(w)>1 and CJK_WORD.fullmatch(w)),key=len,reverse=True):
+        by_first.setdefault(word[0], []).append(word)
+    return by_first
+
+
 def _curriculum_segment(fragment, by_first):
     """教材詞庫優先的最長比對；剩餘片段交 Jieba 斷詞。
     避免以已學單字拼出未教過的雙字詞，故已學單字不參與優先比對。
@@ -287,9 +297,7 @@ def audit(text,known,target,original,allow,text_evidence=None,grammar_evidence=N
     # 第一次初始化採專案字典，逐份文本用同一個全局只讀詞庫。
     normalized=cleanbody(text)
     fragments=CJK_WORD.findall(normalized)
-    by_first = {}
-    for word in sorted((w for w in baseline if len(w)>1 and CJK_WORD.fullmatch(w)),key=len,reverse=True):
-        by_first.setdefault(word[0], []).append(word)
+    by_first = curriculum_word_index(baseline)
     tokens=[]
     for f in fragments:
         tokens.extend(_curriculum_segment(f, by_first))
@@ -315,6 +323,17 @@ def audit(text,known,target,original,allow,text_evidence=None,grammar_evidence=N
     return {'字數':count_han(text),'目標詞複現':counts,'疑似超綱':unknown,'疑似超綱詞次':sum(unknown.values()),
             '全文中文字詞次':sum(1 for w in tokens if HAN_RE.search(w)), '已學證據分類':evidence_counts,
             '原文連續片段重合率':overlap,'整體字元相似度':sim,'重合片段':examples}
+
+
+
+def per_text_target_audit(text, config, known, allow, text_evidence, grammar_evidence, names):
+    baseline = set(known) | set(allow) | set(text_evidence) | set(grammar_evidence) | set(names)
+    index = curriculum_word_index(baseline)
+
+    def token_views(fragment):
+        return _curriculum_segment(fragment, index), TOKENIZER.lcut(fragment, HMM=False)
+
+    return audit_per_text(text, config, token_views, cleanbody, CJK_WORD)
 
 
 def format_prompt(text):
@@ -788,6 +807,7 @@ def editable_quiz_checks(instructions,questions,answers,requested_qty,requested_
 def remember_draft_lesson(lesson_id):
     """Track the context of teacher edits without changing their draft."""
     st.session_state['draft_lesson_id'] = lesson_id
+    invalidate_audit(st.session_state)
 
 
 with st.sidebar:
@@ -907,8 +927,11 @@ source=lesson[reference]; gtarget=grammar(lesson,[reference])
 known=get_lexicon(idx)
 text_evidence, grammar_evidence, original_sentences, grammar_sentences=curriculum_evidence(idx)
 attested_phrases=original_sentences+grammar_sentences
-target_snapshot = configuration_signature({**target_config, 'reference': reference, 'form': form})
-if st.session_state.get('active_target_settings') != target_snapshot:
+target_snapshot = configuration_signature({**target_config, 'reference': reference, 'form': form,
+                                             'allowed': sorted(allowed), 'names': sorted(approved_names)})
+text_changed = ('audited_text' in st.session_state and
+                st.session_state['audited_text'] != st.session_state.get('draft',''))
+if st.session_state.get('active_target_settings') != target_snapshot or text_changed:
     had_previous_work = bool(st.session_state.get('last_audit') or st.session_state.get('approved')
                              or st.session_state.get('v2_loaded'))
     invalidate_audit(st.session_state)
@@ -931,7 +954,7 @@ with st.expander('查看教材來源與複現目標',expanded=False):
     st.caption(f'截至本課：全課文重建斷詞 {len(text_evidence)} 項（主要已學比對集合）；生詞表 {len(known)} 項（教材證據）；語法例句 {len(grammar_evidence)} 項；整課字數約 {whole_len} 字。')
     st.info('目前 JSON 未保留原始人工校訂的全課斷詞清單；此處從完整課文使用本專案 Jieba 字典重建。若您有原始斷詞 JSON，可再替換。')
 
-st.info('本批已提供逐詞逐篇最低次數設定；現有檢測仍是彙總字串次數參考，尚未以完整詞彙逐篇判定最低次數。請由教師審核。')
+st.info('Python逐詞逐篇檢測將確定詞次與可疑候選分開；分篇不明或歧義仍須教師核對。舊版彙總字串次數僅供參考，不代替逐篇結果。')
 with st.expander('查看本次逐詞逐篇最低要求', expanded=False):
     st.dataframe([{'目標詞': word, '篇章': piece, '最低次數': value}
                   for word, counts in target_minimums.items() for piece, value in counts.items()],
@@ -955,18 +978,23 @@ with st.expander('生成提示詞',expanded=True):
     format_prompt(prompt1)
 
 st.subheader('第二階段｜貼回文本、Python 檢測、修訂')
+st.caption('多篇請各用【文本一】標題、【文本二】標題等獨立標題行，正文另起一行；單篇可直接貼正文。漏篇或分篇不明不以全文合計替代。')
 st.session_state.setdefault('draft_lesson_id', idx)
 if st.session_state.get('draft','').strip() and st.session_state['draft_lesson_id'] != idx:
     st.warning('保留草稿可能來自先前課次，請確認是否適用於目前課次。此提醒不會刪改草稿，也不阻擋操作。')
 st.text_area('將 LLM 產生的閱讀文本貼在這裡（可直接修改）',height=280,key='draft',
              on_change=remember_draft_lesson,args=(idx,))
 if st.button('執行 Python 檢測',type='primary'):
-    raw=st.session_state.get('draft','').strip()
-    if not raw:
+    raw=st.session_state.get('draft','')
+    if not raw.strip():
         st.warning('請先貼入文本。')
     else:
         report=audit(raw,known,target,source,allowed,text_evidence,grammar_evidence,approved_names,attested_phrases)
-        report['未核准說話者']=speaker_warnings(raw,approved_names) if form=='對話' else []
+        report['逐篇複現']=per_text_target_audit(raw,target_config,known,allowed,text_evidence,grammar_evidence,approved_names)
+        header_lines = {piece['header_line'] for piece in report['逐篇複現']['pieces']}
+        speaker_body = '\n'.join(line for number, line in enumerate(raw.splitlines(), 1)
+                                 if number not in header_lines)
+        report['未核准說話者']=speaker_warnings(speaker_body,approved_names) if form=='對話' else []
         st.session_state['last_audit']=report
         st.session_state['audited_text']=raw
         st.session_state['audited_names']=tuple(sorted(approved_names))
@@ -977,11 +1005,27 @@ report=st.session_state.get('last_audit')
 if report:
     c1,c2,c3,c4=st.columns(4)
     c1.metric('正文中文字數',report['字數'])
-    c2.metric('目標詞至少出現一次',f"{sum(bool(v) for v in report['目標詞複現'].values())}/{len(target)}")
+    c2.metric('舊版彙總命中目標（參考）',f"{sum(bool(v) for v in report['目標詞複現'].values())}/{len(target)}")
     c3.metric('教材未收錄詞次',report['疑似超綱詞次'])
     c4.metric('與原文相似度',f"{report['整體字元相似度']:.0%}")
     st.caption('先採截至本課的全課文斷詞與課文連續用詞，再對照生詞表、語法例句、歷來已學人名與教師允許詞。未找到的項目仍需核對。')
     st.write('**檢測依據統計：**', '；'.join(f'{k} {v} 詞次' for k,v in report['已學證據分類'].items()))
+    per_text = report['逐篇複現']
+    st.markdown('**逐詞逐篇檢測（Python）**')
+    st.caption('確定詞次須為教材優先斷詞與同一Jieba結果邊界一致的完整詞；可疑候選不算確定詞次。確定不足量＝最低要求減確定詞次（至少0）；有歧義時仍須教師核對最終缺額。缺篇或格式不明以空值及待核對呈現。')
+    if per_text['issues']:
+        st.warning('分篇／設定或斷詞待核對：' + '；'.join(per_text['issues']))
+    if per_text['rows']:
+        st.dataframe(per_text['rows'], hide_index=True, use_container_width=True)
+    else:
+        st.info('目前未設定目標詞，不自動宣稱複現達標。')
+    with st.expander('斷詞歧義與候選證據（供教師核對）', expanded=bool(per_text['ambiguities'])):
+        st.caption('行號從1起算；行內位置從0起算，結束位置不含該字元。可疑數是候選位置數，不當作正式詞次。')
+        if per_text['ambiguities']:
+            st.dataframe(per_text['ambiguities'], hide_index=True, use_container_width=True)
+        else:
+            st.caption('目前沒有可追溯的歧義候選；這不代表分篇格式或所有教學條件均已通過。')
+
     if report['未核准說話者']:
         st.error('出現未經教師核准的說話者：'+'、'.join(report['未核准說話者'])+'。請先改名、調整允許名單，然後重新檢測。')
     if report['原文連續片段重合率']>.25 or report['整體字元相似度']>.7:
@@ -990,7 +1034,7 @@ if report:
         st.info('篇幅提醒：請逐篇檢查是否符合每篇字數範圍；目前顯示總正文概估字數。')
     left,right=st.columns(2)
     with left:
-        st.markdown('**目標詞複現次數**')
+        st.markdown('**舊版彙總字串命中（僅供參考）**')
         st.dataframe([{'生詞':w,'次數':v} for w,v in report['目標詞複現'].items()],hide_index=True,use_container_width=True)
     with right:
         st.markdown('**教材詞庫未收錄詞（待核對）**')
@@ -1008,6 +1052,7 @@ if report:
     with st.expander('補充生詞說明（可於第四階段編輯）',expanded=bool(retained)):
         st.code('\n'.join(f'{w}：' for w in retained) if retained else '目前尚未選擇保留詞',language='text')
     with st.expander('生成修訂提示詞（選用）'):
+        st.caption('此處保留舊版修訂流程；字串未命中僅供參考，尚未依逐篇正式結果自動產生不足項修訂。')
         notes=st.text_area('教師修訂意見',placeholder='例如：保留人物，但改變事件；增加當課未使用詞；調整自然度。')
         lack='、'.join(w for w,c in report['目標詞複現'].items() if not c) or '無'
         to_repair='、'.join(f'{w}({c})' for w,c in report['疑似超綱'].most_common(45) if w not in retained) or '無'
@@ -1017,12 +1062,13 @@ if report:
 【待修訂文本】
 {st.session_state['draft']}
 【教師意見】{notes or '優先檢查未收錄詞、自然度及複現'}
-【檢測線索（不等於確定錯誤）】待核對詞：{to_repair}；未複現生詞：{lack}；與原文相似度：{report['整體字元相似度']:.0%}。
+【檢測線索（不等於確定錯誤）】待核對詞：{to_repair}；舊版字串未命中（僅供參考）：{lack}；與原文相似度：{report['整體字元相似度']:.0%}。
 核准引導詞：{'、'.join(guiding_words) or '無'}；必須保留的補充詞：{'、'.join(retained) or '無'}。
 【要求】先核對斷詞誤判，再必要時以已學詞改寫；引導情節及核准詞不可無故刪除。每篇約{target_len[0]}–{target_len[1]}字；如過度照搬原文，須改變目的、資訊或結果。僅輸出完整修訂文本，不附分析或出處。'''
         format_prompt(prompt2)
     st.markdown('**教師確認定稿**')
     st.caption('檢測後如要人工修改，請重新檢測。確認前不能進行命題。')
+    st.caption('定稿是教師人工決定，不會把未達標或待核對的逐篇結果自動改成達標；請先核對表格、分篇與歧義證據。')
     names_changed=st.session_state.get('audited_names') != tuple(sorted(approved_names))
     guides_changed=st.session_state.get('audited_guides') != tuple(sorted(guiding_words))
     targets_changed=st.session_state.get('audited_target_settings') != target_snapshot
