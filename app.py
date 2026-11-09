@@ -4,6 +4,7 @@ from __future__ import annotations
 import io
 import json
 import re
+import sys
 from collections import Counter
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -14,6 +15,10 @@ from docx import Document
 from docx.shared import Pt, Cm
 
 HERE = Path(__file__).resolve().parent
+# AppTest scripts may start with tests/ as sys.path[0]; sibling imports still need HERE.
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+from target_settings import combine_targets, minimum_matrix, configuration_signature, invalidate_audit
 DATA = json.loads((HERE / 'corpus.json').read_text(encoding='utf-8'))
 
 # 專案既有繁體大字典優先：GitHub repo 根目錄，其次 dictionaries/。
@@ -780,6 +785,11 @@ def editable_quiz_checks(instructions,questions,answers,requested_qty,requested_
         issues.append(f'教師答案 {len(actual_answers)} 項，題目 {len(heads)} 題。')
     return issues
 
+def remember_draft_lesson(lesson_id):
+    """Track the context of teacher edits without changing their draft."""
+    st.session_state['draft_lesson_id'] = lesson_id
+
+
 with st.sidebar:
     st.header('教材與生成設定')
     book=st.selectbox('冊別',uniq(d['冊'] for d in DATA))
@@ -791,17 +801,72 @@ with st.sidebar:
     form=st.selectbox('新文本形式',['對話','閱讀短文'])
     n=st.selectbox('生成篇數',[1,2,3])
     relation=st.selectbox('多篇關係',['各篇獨立','連續故事']) if n>1 else '單篇'
+
+    st.subheader('目標複現詞與最低次數')
+    candidates = words(lesson)
+    target_store = st.session_state.setdefault('target_settings_by_lesson', {})
+    saved_targets = target_store.setdefault(idx, {
+        'selected': words(lesson, [reference]), 'manual': '', 'uniform': 1, 'minimums': {},
+    })
+    prefix = f'tv_{idx}'
+    st.session_state.setdefault(prefix + '_selected', saved_targets['selected'])
+    st.session_state.setdefault(prefix + '_manual', saved_targets['manual'])
+    st.session_state.setdefault(prefix + '_uniform', saved_targets['uniform'])
+    selected_targets = st.multiselect(
+        '勾選本次目標詞（當課所有文本生詞）', candidates, key=prefix + '_selected',
+        help='初次暫沿用參考課文生詞預選，可自由取消；切換同課來源不限制候選或重設選詞。',
+    )
+    manual_targets_raw = st.text_area(
+        '手動增加目標詞（不自動視為已學或允許詞）', key=prefix + '_manual', height=75,
+        help='可填以前的難詞或指定詞，以換行、逗號、分號或空白分隔；與引導詞、一般允許詞分開。',
+    )
+    target = combine_targets(selected_targets, manual_targets_raw)
+    uniform_minimum = st.number_input(
+        '批次最低次數（按套用才覆寫目前各格）', min_value=1, step=1, key=prefix + '_uniform',
+    )
+    st.caption('本批先支援至少1次的整數；新詞與新篇預設1次。批次套用會覆寫目前顯示的個別值，可再調整。')
+    apply_uniform = st.button('套用至目前所有詞與篇章（覆寫個別值）', key=prefix + '_apply',
+                              disabled=not target)
+    target_minimums = minimum_matrix(target, n, saved_targets['minimums'])
+    if apply_uniform:
+        for word in target:
+            for piece in range(1, n + 1):
+                st.session_state[f'{prefix}_min_{word}_{piece}'] = int(uniform_minimum)
+    with st.expander('逐詞逐篇最低次數', expanded=False):
+        if not target:
+            st.info('目前沒有選定目標詞；可勾選或手動新增。')
+        for word in target:
+            columns = st.columns(n)
+            for piece, column in enumerate(columns, 1):
+                cell_key = f'{prefix}_min_{word}_{piece}'
+                st.session_state.setdefault(cell_key, target_minimums[word][piece])
+                with column:
+                    value = st.number_input(f'{word}｜第{piece}篇最低次數', min_value=1,
+                                            step=1, key=cell_key)
+                target_minimums[word][piece] = int(value)
+                saved_targets['minimums'].setdefault(word, {})[piece] = int(value)
+    saved_targets.update(selected=list(selected_targets), manual=manual_targets_raw,
+                         uniform=int(uniform_minimum))
+    st.session_state['target_settings_by_lesson'] = target_store
+    target_config = {
+        'lesson_id': idx, 'targets': target, 'selected': list(selected_targets),
+        'manual_targets': combine_targets([], manual_targets_raw),
+        'minimums': target_minimums, 'text_count': n, 'batch_value': int(uniform_minimum),
+    }
+    st.session_state['target_config'] = target_config
+
     whole='\n'.join(lesson.get(p,'') for p in PARTS)
     whole_len=count_han(whole)
     length=st.selectbox('每篇字數',['依整課課文總長度','100–150','200–300','400–500'])
     target_len={'依整課課文總長度':(max(30,round(whole_len*.8)),max(40,round(whole_len*1.2))), '100–150':(100,150),'200–300':(200,300),'400–500':(400,500)}[length]
-    cover=st.selectbox('本次目標詞覆蓋需求',['自然度優先','每篇至少60%','每篇至少80%'])
+    cover=st.selectbox('舊版覆蓋偏好（保留參考）',['自然度優先','每篇至少60%','每篇至少80%'],key='legacy_cover')
+    st.caption('主要複現要求是逐詞逐篇最低次數；舊版百分比僅保留參考，不取代最低要求，也不代表已完成正式逐篇檢測。')
     theme=st.text_input('新情境／主題（選填）', placeholder='例如：從機場接人改為在校園第一次見面')
     guiding_raw=st.text_area(
         '補充引導詞（選填，建議 2～3 個）',
         height=76,
         placeholder='例如：機場、朋友、第一次',
-        help='教師指定且允許使用的詞彙。供 LLM 發想新的事件與情境，不列入當課生詞複現率，也不列為超綱。',
+        help='教師指定且允許使用的詞彙。供 LLM 發想新的事件與情境，僅作引導時不列入複現目標；若需計次請另選為目標。引導詞沿用教師允許集合。',
     )
     guiding_words=uniq(re.split(r'[,，、\n；;\s]+',guiding_raw))
     if guiding_words:
@@ -838,23 +903,39 @@ with st.sidebar:
     glossary_language_text='、'.join(glossary_languages)
 
 
-source=lesson[reference]; target=words(lesson,[reference]); gtarget=grammar(lesson,[reference])
+source=lesson[reference]; gtarget=grammar(lesson,[reference])
 known=get_lexicon(idx)
 text_evidence, grammar_evidence, original_sentences, grammar_sentences=curriculum_evidence(idx)
 attested_phrases=original_sentences+grammar_sentences
+target_snapshot = configuration_signature({**target_config, 'reference': reference, 'form': form})
+if st.session_state.get('active_target_settings') != target_snapshot:
+    had_previous_work = bool(st.session_state.get('last_audit') or st.session_state.get('approved')
+                             or st.session_state.get('v2_loaded'))
+    invalidate_audit(st.session_state)
+    st.session_state['active_target_settings'] = target_snapshot
+    if had_previous_work:
+        st.info('目標或課文設定已變更，先前檢測與定稿狀態已失效。已保留閱讀文本及編輯內容，請重新檢測並核對命題依據。')
+# Keep teacher text and per-lesson settings across source/form/count/lesson changes.
 current_key=f'{idx}:{reference}:{form}:{n}'
-if st.session_state.get('active_key')!=current_key:
-    st.session_state['active_key']=current_key
-    for k in ['draft','final_text','quiz_text','answer_text','approved','last_audit','audited_text','retained_words','glossary_editor','quiz_allowed_raw','audited_names','audited_guides','v2_raw_json','v2_title','v2_body','v2_vocab','v2_instructions','v2_questions','v2_answers','v2_loaded','v2_show_vocab','v22_warnings','v22_json_structure_issues','v22_json_vocab_issues']:
-        st.session_state.pop(k,None)
+st.session_state['active_key'] = current_key
+target_minimum_text = '；'.join(
+    word + '：' + '、'.join(f'第{piece}篇至少{value}次' for piece, value in counts.items())
+    for word, counts in target_minimums.items()
+)
 
 with st.expander('查看教材來源與複現目標',expanded=False):
     st.write('**原課文：**');st.text(source)
-    st.write('**當課目標生詞：**','、'.join(target) or '（原文未載）')
+    st.write('**本次目標複現詞（已合併去重）：**','、'.join(target) or '（未選詞）')
     st.write('**本次補充引導詞（教師允許）：**','、'.join(guiding_words) or '未設定')
     st.write('**當課目標語法：**','；'.join(gtarget) or '（原文未載）')
-    st.caption(f'截至本課：全課文重建斷詞 {len(text_evidence)} 項（主要已學比對集合）；生詞表 {len(known)} 項（複現目標來源）；語法例句 {len(grammar_evidence)} 項；整課字數約 {whole_len} 字。')
+    st.caption(f'截至本課：全課文重建斷詞 {len(text_evidence)} 項（主要已學比對集合）；生詞表 {len(known)} 項（教材證據）；語法例句 {len(grammar_evidence)} 項；整課字數約 {whole_len} 字。')
     st.info('目前 JSON 未保留原始人工校訂的全課斷詞清單；此處從完整課文使用本專案 Jieba 字典重建。若您有原始斷詞 JSON，可再替換。')
+
+st.info('本批已提供逐詞逐篇最低次數設定；現有檢測仍是彙總字串次數參考，尚未以完整詞彙逐篇判定最低次數。請由教師審核。')
+with st.expander('查看本次逐詞逐篇最低要求', expanded=False):
+    st.dataframe([{'目標詞': word, '篇章': piece, '最低次數': value}
+                  for word, counts in target_minimums.items() for piece, value in counts.items()],
+                 hide_index=True, use_container_width=True)
 
 st.subheader('第一階段｜生成真正的新文本')
 with st.expander('生成提示詞',expanded=True):
@@ -864,15 +945,21 @@ with st.expander('生成提示詞',expanded=True):
 【生成條件】
 - 事件目的、關鍵資訊或結果須與原文不同；不能只改姓名、地點或順序。{('情境：'+theme+'。') if theme else ''}
 - 教師核准人名／說話者：{'、'.join(approved_names) or '無；不使用人名'}；不可自行新增。
-- 教師核准引導詞：{'、'.join(guiding_words) or '無'}。優先以其意義發展新情節，可自然出現，但不須全部強制出現，亦不計複現率。
+- 教師核准引導詞：{'、'.join(guiding_words) or '無'}。優先以其意義發展新情節，可自然出現，但不須全部強制出現，也不自動成為複現目標。
 - 每篇約 {target_len[0]}–{target_len[1]} 個中文字（不含標題與說話者）；{('各篇各有完整事件、篇幅接近，'+relation) if n>1 else '單篇須有完整事件'}。
 - 優先使用截至本課已學詞；必要新詞盡量少，使用臺灣繁體中文。
-- 本課複現生詞：{'、'.join(target) or '無'}；語法：{'；'.join(gtarget) or '無'}；覆蓋要求：{cover}。須自然正確，不機械堆疊。
+- 本次目標複現詞：{'、'.join(target) or '無'}；語法：{'；'.join(gtarget) or '無'}。須自然正確，不機械堆疊。
+- 主要複現要求：逐詞逐篇最低次數：{target_minimum_text or "未選定目標詞"}。
+- 舊版覆蓋偏好（僅供參考）：{cover}；不代表已完成正式逐篇檢測，不得降低上述最低次數。
 【輸出】僅輸出「【文本一】標題」與正文；多篇依序編號。不得輸出原課文、測驗、詞義、分析、詞彙來源或檢測報告。'''
     format_prompt(prompt1)
 
 st.subheader('第二階段｜貼回文本、Python 檢測、修訂')
-st.text_area('將 LLM 產生的閱讀文本貼在這裡（可直接修改）',height=280,key='draft')
+st.session_state.setdefault('draft_lesson_id', idx)
+if st.session_state.get('draft','').strip() and st.session_state['draft_lesson_id'] != idx:
+    st.warning('保留草稿可能來自先前課次，請確認是否適用於目前課次。此提醒不會刪改草稿，也不阻擋操作。')
+st.text_area('將 LLM 產生的閱讀文本貼在這裡（可直接修改）',height=280,key='draft',
+             on_change=remember_draft_lesson,args=(idx,))
 if st.button('執行 Python 檢測',type='primary'):
     raw=st.session_state.get('draft','').strip()
     if not raw:
@@ -884,6 +971,7 @@ if st.button('執行 Python 檢測',type='primary'):
         st.session_state['audited_text']=raw
         st.session_state['audited_names']=tuple(sorted(approved_names))
         st.session_state['audited_guides']=tuple(sorted(guiding_words))
+        st.session_state['audited_target_settings']=target_snapshot
         st.session_state['approved']=False
 report=st.session_state.get('last_audit')
 if report:
@@ -937,9 +1025,10 @@ if report:
     st.caption('檢測後如要人工修改，請重新檢測。確認前不能進行命題。')
     names_changed=st.session_state.get('audited_names') != tuple(sorted(approved_names))
     guides_changed=st.session_state.get('audited_guides') != tuple(sorted(guiding_words))
-    if st.session_state.get('audited_text') != st.session_state.get('draft') or names_changed or guides_changed:
+    targets_changed=st.session_state.get('audited_target_settings') != target_snapshot
+    if st.session_state.get('audited_text') != st.session_state.get('draft') or names_changed or guides_changed or targets_changed:
         st.warning('文本、核准人名或補充引導詞在上次檢測後變更，請重新檢測。')
-    if st.button('將目前檢測內容確認為定稿', disabled=(st.session_state.get('audited_text') != st.session_state.get('draft') or names_changed or guides_changed or bool(report['未核准說話者']))):
+    if st.button('將目前檢測內容確認為定稿', disabled=(st.session_state.get('audited_text') != st.session_state.get('draft') or names_changed or guides_changed or targets_changed or bool(report['未核准說話者']))):
         st.session_state['final_text']=st.session_state['draft']
         st.session_state['approved']=True
         st.session_state['quiz_text']=''
@@ -1025,7 +1114,7 @@ if st.button('解析 JSON 並填入以下編輯區',type='primary'):
 
 # 可從目前教師定稿建立閱讀文本初稿，毋須先生成題目。
 if st.button('只載入已定稿閱讀文本（暫不命題）'):
-    st.session_state['v2_body']=st.session_state.get('final_text') or st.session_state.get('draft','')
+    st.session_state['v2_body']=(st.session_state.get('final_text','') if st.session_state.get('approved') else st.session_state.get('draft',''))
     st.session_state.setdefault('v2_title',f"{book}{lesson['課']} 閱讀測驗")
     st.session_state.setdefault('v2_vocab','')
     st.session_state.setdefault('v2_instructions','')
