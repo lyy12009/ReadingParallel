@@ -87,12 +87,13 @@ def _piece_counts(record, targets, token_views, clean_line, fragment_pattern):
         cleaned = clean_line(raw)
         if not cleaned.strip():
             continue
-        has_body = True
         body_start = raw.rfind(cleaned)
         if body_start < 0:
             issues.append(f'第{record["number"]}篇第{line_number}行清理結果無法對齊原文。')
             continue
         for fragment_match in fragment_pattern.finditer(cleaned):
+            # Reuse the existing lexical pattern; punctuation alone is not a body.
+            has_body = True
             fragment = fragment_match.group()
             try:
                 curriculum, jieba = token_views(fragment)

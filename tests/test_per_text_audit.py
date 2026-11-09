@@ -64,6 +64,40 @@ class PerTextUnitTests(unittest.TestCase):
         self.assertEqual((row['確定出現次數'], row['可疑出現次數']), (0, 0))
         self.assertEqual(row['狀態'], '未達標')
 
+    def test_punctuation_symbols_and_whitespace_are_not_lexical_bodies(self):
+        bodies = ['……', '，。！？；：', '... !?', '*** --- +++', '★☆→←', '🙂🎈', ' \t\n　']
+        for body in bodies:
+            for headed in (False, True):
+                with self.subTest(body=body, headed=headed):
+                    text = ('【文本一】咖啡標題\n' if headed else '') + body
+                    result = self.run_audit(text, baseline={'咖啡'})
+                    self.assertTrue(result['issues'])
+                    row = result['rows'][0]
+                    self.assertEqual(row['狀態'], '待核對')
+                    for column in ['確定出現次數', '可疑出現次數', '確定不足量']:
+                        self.assertIsNone(row[column])
+                    if headed:
+                        self.assertTrue(any('可辨識正文' in issue for issue in result['issues']))
+
+    def test_symbol_only_piece_does_not_hide_another_normal_piece(self):
+        result = self.run_audit('【文本一】標題\n……\n【文本二】正常\n咖啡。',
+                                config(count=2), {'咖啡'})
+        self.assertEqual(result['rows'][0]['狀態'], '待核對')
+        self.assertIsNone(result['rows'][0]['確定出現次數'])
+        self.assertIsNone(result['rows'][0]['確定不足量'])
+        self.assertEqual(result['rows'][1]['狀態'], '達標')
+        self.assertEqual(result['rows'][1]['確定出現次數'], 1)
+        self.assertEqual(result['rows'][1]['確定不足量'], 0)
+
+    def test_normal_content_with_or_without_target_remains_a_body(self):
+        for body, count, status in [('咖啡。', 1, '達標'), ('茶。', 0, '未達標'),
+                                    ('……咖啡！★', 1, '達標')]:
+            with self.subTest(body=body):
+                result = self.run_audit('【文本一】標題\n' + body, baseline={'咖啡', '茶'})
+                self.assertEqual(result['issues'], [])
+                self.assertEqual(result['rows'][0]['確定出現次數'], count)
+                self.assertEqual(result['rows'][0]['狀態'], status)
+
     def test_three_texts_cannot_borrow_counts_from_each_other(self):
         text = '【文本一】甲\n咖啡，咖啡，咖啡。\n【文本二】乙\n茶。\n【文本三】丙\n茶。'
         result = self.run_audit(text, config(count=3), {'咖啡', '茶'})
@@ -225,6 +259,22 @@ class PerTextUITests(unittest.TestCase):
                          [('咖啡', 1, 2, 1, 1, '未達標'), ('咖啡', 2, 1, 1, 0, '達標'),
                           ('咖啡', 3, 3, 1, 2, '未達標'), ('茶', 1, 1, 1, 0, '達標'),
                           ('茶', 2, 2, 2, 0, '達標'), ('茶', 3, 1, 1, 0, '達標')])
+
+    def test_symbol_only_body_shows_unknown_without_changing_teacher_input(self):
+        app = self.app(2)
+        body = '  【文本一】標題\n…… \n【文本二】正常\n咖啡。\n'
+        result = self.audit(app, body)
+        self.assertEqual(app.session_state['draft'], body)
+        self.assertEqual(app.session_state['audited_text'], body)
+        first, second = result['rows']
+        self.assertEqual(first['狀態'], '待核對')
+        for column in ['確定出現次數', '可疑出現次數', '確定不足量']:
+            self.assertIsNone(first[column])
+        self.assertEqual(second['狀態'], '達標')
+        self.assertTrue(any('第1篇' in w.value and '可辨識正文' in w.value for w in app.warning))
+        app.run()
+        self.healthy(app)
+        self.assertEqual(app.session_state['draft'], body)
 
     def test_table_has_current_per_piece_numbers(self):
         app = self.app(3)
