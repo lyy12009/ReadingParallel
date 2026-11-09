@@ -94,3 +94,27 @@ C歧義證據：原始第2行，行內[4,6)為「咖啡」，片段「安同想�
 - 本機教師需依清單逐項填寫通過／失敗／待決與原文證據；未完成項不填已通過。本報告不構成部署核准。
 
 下一步為教師執行操作清單並回報IA／Q編號及重現材料；後續修正與遠端操作另待授權。本次僅本機Commit，不Push、不建立PR、不合併main、不部署。
+
+## PR #7審查修正：IA-01觀察與報告一致性
+
+本節補充上面的歷史驗收結果，僅修正測試證據與報告一致性；沒有修改產品或要求永久保留IA-01。
+
+- tests/acceptance_replay.py新增IA01_EXPECTATION，明列報告所依據的產品基準3fc00d01a1bbb79f8b692d07518d26d582af01ec與observed=True。這是目前基準預期可重現的觀察，不是教學規則或產品必須維持的行為。
+- check_ia01_evidence()逐案比對實際布林觀察。evidence.json保留known_word_editor_gap_observed，另加各案ia01.expected_observed、observed、status（MATCH／MISMATCH）；頂層記ia01_expectation、evidence_consistency及recheck_required。
+- 先保存三案證據，再判定整體結果。任何觀察缺漏／型別錯誤／與預期不符，都記MISMATCH與具體案例，要求重新檢查產品、觀察方式及報告；以RuntimeError非零結束，且不輸出逐案或整體重播PASS。不得沿用「三案均成功重現」的舊敘述。
+- 當前真實重播A／B／C皆為expected=True、observed=True、MATCH，六份Word既有結構檢查仍通過。MATCH只表示證據符合目前報告，不代表IA-01已修復或教學驗收通過。
+- 未來確認產品已修復後，應更新IA01_EXPECTATION的產品基準與observed=False，同步修訂本報告／教師清單的已知限制說明，再重跑。False觀察可與False預期匹配；若缺陷再出現則不一致，不需要修改產品來維持缺陷。
+
+新增tests/test_acceptance_evidence.py的4項純證據測試：逐案記錄、預期重現卻未觀察的失配、未來修復預期與缺陷再現、缺漏／錯誤型別觀察不當作通過。先實際重現缺少一致性檢查的失敗，再實作。原有114項保留，完整discover現在合計118項。
+
+另做一次明確標示的故障模擬：只在驗收觀察資料將A改為False，不修改或模擬產品程式；確認保存FAIL證據並拋出RuntimeError、沒有重播PASS。模擬資料另存test-results/ia01-negative-policy；正常三案證據仍在原integration-acceptance目錄，兩者不混用。這證明失配會中止，不是聲稱真實產品已修復。
+
+重跑命令沿用上文；另可單獨執行：
+
+~~~powershell
+.\.venv\Scripts\python.exe -B -m unittest discover -s tests -p test_acceptance_evidence.py -v
+~~~
+
+兩項冒煙、真實三案／六份Word、依賴及語法／Git差異檢查結果見本次交付與PR說明。未執行外部LLM、瀏覽器人工操作、教學品質或Word視覺驗收，既有待辦不因此結案。
+
+本次最終實跑：原有114項＋新增4項＝118項全部通過，24.448秒；兩項冒煙、三案真實離線重播及六份Word既有結構檢查通過。正常證據三案均expected=True／observed=True／MATCH，頂層evidence_consistency=PASS、recheck_required=[]；失配故障模擬另記FAIL並明確中止。

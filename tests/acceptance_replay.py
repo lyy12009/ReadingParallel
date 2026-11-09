@@ -20,6 +20,9 @@ from streamlit.testing.v1 import AppTest
 ROOT = Path(__file__).absolute().parents[1]
 OUTPUT = ROOT / 'test-results' / 'integration-acceptance'
 LANGUAGES = ['English（英語）', '繁體中文（臺灣）']
+# Update this baseline together with the report after a verified product fix.
+IA01_EXPECTATION = {'baseline': '3fc00d01a1bbb79f8b692d07518d26d582af01ec',
+                    'observed': True}
 
 CASES = [{'id': 'A',
   'book': '第三冊',
@@ -111,6 +114,24 @@ def audit(app, body):
     assert app.session_state['audited_text'] == body
     assert not app.session_state['approved']
     return copy.deepcopy(app.session_state['last_audit'])
+
+
+def check_ia01_evidence(evidence, expected_observed):
+    """Compare observations to an explicit report baseline, not a desired defect."""
+    if type(expected_observed) is not bool:
+        raise ValueError('IA-01預期值須為布林值，請重新檢查基準與報告。')
+    mismatches = []
+    for case in evidence:
+        observed = case.get('known_word_editor_gap_observed')
+        matches = type(observed) is bool and observed == expected_observed
+        case['ia01'] = {'expected_observed': expected_observed, 'observed': observed,
+                        'status': 'MATCH' if matches else 'MISMATCH'}
+        if not matches:
+            mismatches.append(
+                f"IA-01案例{case['case']}觀察與報告基準不一致："
+                f"預期觀察={expected_observed!r}，實際={observed!r}；"
+                "請重新檢查產品狀態、觀察方式及驗收報告，不得宣稱已成功重現。")
+    return mismatches
 
 
 def main():
@@ -282,10 +303,13 @@ def main():
             old_final = app.session_state['final_text']
             app.text_area(key='v2_body').set_value(body + '\n獨角獸太空港。').run()
             healthy(app)
-            editor_gap = (app.session_state['approved'] and
-                          app.session_state['audited_text'] == old_final and
-                          app.session_state['draft'] == old_final and
-                          app.session_state['v2_body'] != old_final)
+            editor_state = {key: app.session_state[key]
+                            for key in ('approved', 'audited_text', 'draft', 'v2_body')
+                            if key in app.session_state}
+            editor_gap = bool(editor_state.get('approved', False) and
+                              editor_state.get('audited_text') == old_final and
+                              editor_state.get('draft') == old_final and
+                              editor_state.get('v2_body') != old_final)
             app.text_area(key='v2_body').set_value(body).run()
             # Cross-batch invalidation retains both teacher text stores and history.
             app.number_input(key=f'{prefix}_min_{configured["targets"][0]}_1').set_value(
@@ -308,11 +332,19 @@ def main():
                 'quiz_edit_recheck_observed': True,
                 'glossary_print_toggle': 'PASS' if case.get('glossary') else 'NOT APPLICABLE',
                 'educational_acceptance': 'NOT PERFORMED; C ambiguity remains unresolved'})
-        print('PASS: offline acceptance replay ' + case['id'])
     for name, digest in protected.items():
         assert hashlib.sha256((ROOT / name).read_bytes()).hexdigest() == digest
+    mismatches = check_ia01_evidence(evidence, IA01_EXPECTATION['observed'])
     (OUTPUT / 'evidence.json').write_text(json.dumps(
-        {'protected_sha256': protected, 'cases': evidence}, ensure_ascii=False, indent=2), encoding='utf-8')
+        {'protected_sha256': protected, 'cases': evidence,
+         'ia01_expectation': IA01_EXPECTATION,
+         'evidence_consistency': 'FAIL' if mismatches else 'PASS',
+         'recheck_required': mismatches}, ensure_ascii=False, indent=2), encoding='utf-8')
+    if mismatches:
+        raise RuntimeError('\n'.join(mismatches) + '\n已保存evidence.json，請重新檢查。')
+    for case in evidence:
+        print(f"PASS: offline acceptance replay {case['case']}; IA-01 "
+              f"expected={case['ia01']['expected_observed']} observed={case['ia01']['observed']} MATCH")
     print('PASS: three real-lesson offline AppTest replays, six Word files; data hashes unchanged')
 
 
